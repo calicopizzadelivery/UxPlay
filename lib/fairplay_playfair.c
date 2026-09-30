@@ -55,7 +55,12 @@ fairplay_setup(fairplay_t *fp, const unsigned char req[16], unsigned char res[14
         return -1;
     }
 
+    /* The mode is the client's byte, and there are four replies: without
+       this, any client could read up to 36 KB past the table. */
     int mode = req[14];
+    if (mode >= (int) (sizeof(reply_message) / sizeof(reply_message[0]))) {
+        return -1;
+    }
     memcpy(res, reply_message[mode], 142);
     fp->keymsglen = 0;
     return 0;

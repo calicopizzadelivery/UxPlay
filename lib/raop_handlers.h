@@ -630,6 +630,20 @@ raop_handler_setup(raop_conn_t *conn,
     if (PLIST_IS_DATA(req_eiv_node) && PLIST_IS_DATA(req_ekey_node)) {
         // The first SETUP call that initializes keys and timing
 
+        /* 16 and 72 bytes are copied out of these below, whatever size the
+           client sent: refuse anything else rather than read past them. */
+        uint64_t eiv_size = 0, ekey_size = 0;
+        plist_get_data_ptr(req_eiv_node, &eiv_size);
+        plist_get_data_ptr(req_ekey_node, &ekey_size);
+        if (eiv_size != 16 || ekey_size != 72) {
+            logger_log(raop->logger, LOGGER_ERR, "SETUP with a %llu-byte eiv and a %llu-byte ekey;"
+                       " expected 16 and 72", (unsigned long long) eiv_size, (unsigned long long) ekey_size);
+            http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+            plist_free(res_root_node);
+            plist_free(req_root_node);
+            return;
+        }
+
         unsigned char aesiv[16] = { 0 };
         unsigned char aeskey[16] = { 0 };
         unsigned char eaeskey[72] = { 0 };
