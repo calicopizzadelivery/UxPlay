@@ -1,0 +1,78 @@
+// UxPlay on Android: the protocol library (lib/, llhttp, playfair) with a
+// dns_sd shim that hands service registration to NsdManager. The GStreamer
+// renderers and uxplay.cpp are not built; the Android app is the renderer.
+//
+// GPLv3. It links the platform's BoringSSL (libcrypto.so) as the system
+// crypto library, dynamically -- see the project's decision notes.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+cc_defaults {
+    name: "uxplay_defaults",
+    cflags: [
+        "-DSTANDALONE",
+        "-DTARGET_POSIX",
+        "-D_LINUX",
+        "-D_REENTRANT",
+        "-DNOHOLD",
+        // libplist 2.7: both version gates UxPlay tests for are met.
+        "-DPLIST_210",
+        "-DPLIST_230",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-sign-compare",
+        // playfair: branch chains the compiler cannot prove exhaustive.
+        "-Wno-sometimes-uninitialized",
+    ],
+    compile_multilib: "64",
+}
+
+cc_library_static {
+    name: "libuxplay_airplay",
+    defaults: ["uxplay_defaults"],
+    srcs: [
+        "lib/*.c",
+        "lib/llhttp/*.c",
+        "lib/playfair/*.c",
+        "android/dns_sd_android.c",
+    ],
+    local_include_dirs: [
+        "android/include",
+        "lib/playfair",
+        "lib/llhttp",
+    ],
+    export_include_dirs: [
+        "lib",
+        "android/include",
+    ],
+    static_libs: ["libplist-2.0"],
+    export_static_lib_headers: ["libplist-2.0"],
+    shared_libs: [
+        "libcrypto",
+        "liblog",
+    ],
+}
+
+// Loaded by the AirPlay app (org.lineageos.tv.airplay) through JNI.
+cc_library_shared {
+    name: "libuxplay_jni",
+    defaults: ["uxplay_defaults"],
+    srcs: [
+        "android/uxplay_jni.c",
+        // ALAC, for audio-only AirPlay: Android has no ALAC decoder. MIT
+        // licensed, carried over from the shairport-sync port.
+        "android/alac/alac.c",
+    ],
+    local_include_dirs: ["android/alac"],
+    static_libs: [
+        "libuxplay_airplay",
+        "libplist-2.0",
+    ],
+    shared_libs: [
+        "libcrypto",
+        "liblog",
+    ],
+    header_libs: ["jni_headers"],
+}
