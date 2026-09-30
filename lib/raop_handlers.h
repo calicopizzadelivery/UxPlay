@@ -24,6 +24,17 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <plist/plist.h>
+#include <time.h>
+
+/* How long a pin shown by pair-pin-start stays valid: long enough to walk
+   to the phone and type it, short enough that an old one is not left open. */
+#define PIN_LIFETIME_NS (120ULL * 1000000000ULL)
+
+static uint64_t pin_clock_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
 #define AUDIO_SAMPLE_RATE 44100   /* all supported AirPlay audio format use this sample rate */
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000
@@ -254,6 +265,12 @@ raop_handler_pairpinstart(raop_conn_t *conn,
                           char **response_data, int *response_datalen) {
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_INFO, "client sent PAIR-PIN-START request");
+    if (!raop->use_pin) {
+        /* Nothing to pair for, and no reason to put a pin on the screen. */
+        http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+        return;
+    }
+    raop->pin_expiry = pin_clock_ns() + PIN_LIFETIME_NS;
     int pin_4 = 0;
     if (raop->pin > 9999) {
         pin_4 = raop->pin % 10000;
@@ -326,6 +343,16 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         method = NULL;
         plist_get_string_val(req_user_node, &user);
         logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
+        /* A random pin exists only between pair-pin-start and its first use.
+           Without this check a client that never asked for one paired with
+           "0000", which is what raop->pin % 10000 is when none is pending. */
+        if (raop->pin < 10000 && (!raop->use_pin || raop->pin == 0 || pin_clock_ns() > raop->pin_expiry)) {
+            logger_log(raop->logger, LOGGER_ERR, "pair-setup-pin with no pin on screen: refused");
+            raop->pin = 0;
+            plist_mem_free(user);
+            plist_free(req_root_node);
+            goto authentication_failed;
+        }
         snprintf(pin, 6, "%04u", raop->pin % 10000);
         if (raop->pin < 10000) {
             raop->pin = 0;
@@ -400,6 +427,15 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         int ret = 0;
         plist_get_data_val(req_epk_node, &client_epk, &client_epk_len); 
         plist_get_data_val(req_authtag_node, &client_authtag, &client_authtag_len);
+        /* Fixed-size copies follow: refuse anything else. */
+        if (client_epk_len != ED25519_KEY_SIZE || client_authtag_len != GCM_AUTHTAG_SIZE) {
+            logger_log(raop->logger, LOGGER_ERR, "pair-setup-pin (step 3): epk of %d bytes, authTag of %d",
+                       (int) client_epk_len, (int) client_authtag_len);
+            free(client_authtag);
+            free(client_epk);
+            plist_free(req_root_node);
+            goto authentication_failed;
+        }
 
         if (logger_debug) {
             char *str = utils_data_to_string((const unsigned char *) client_epk, client_epk_len, 16);
@@ -422,6 +458,18 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
         }
         pairing_session_set_setup_status(conn->session);
+        conn->pin_verified = true;
+        /* Remember it as soon as it has proved the pin, not only if it goes
+           on to stream; SETUP registers it again with its name. */
+        if (raop->callbacks.register_client) {
+            char *client_device_id = NULL;
+            char *client_pk = NULL;
+            get_pairing_session_client_data(conn->session, &client_device_id, &client_pk);
+            if (client_pk) {
+                raop->callbacks.register_client(raop->callbacks.cls, client_device_id, client_pk, NULL);
+                free(client_pk);
+            }
+        }
         plist_t res_root_node = plist_new_dict();
         plist_t res_epk_node = plist_new_data((const char *) epk, 32);
         plist_t res_authtag_node = plist_new_data((const char *) authtag, 16);
@@ -448,6 +496,13 @@ raop_handler_pairsetup(raop_conn_t *conn,
 
     //data =
     http_request_get_data(request, &datalen);
+    if (raop->use_pin) {
+        /* Pairing without the pin: in pin mode it would let pair-verify
+           through without either the pin or a registration. */
+        logger_log(raop->logger, LOGGER_ERR, "pair-setup without a pin refused: pin mode is on");
+        http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+        return;
+    }
     if (datalen != 32) {
         logger_log(raop->logger, LOGGER_ERR, "Invalid pair-setup data");
         return;
@@ -475,6 +530,8 @@ raop_handler_pairverify(raop_conn_t *conn,
         if (raop->use_pin) {
             pairing_session_set_setup_status(conn->session);
             register_check = true;
+            /* Standing comes from this check alone, whatever came before. */
+            conn->pin_verified = false;
         } else {
             return;
         }
@@ -506,7 +563,8 @@ raop_handler_pairverify(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
         }
         if (register_check) {
-            bool registered_client = true;
+            /* No register to check means nobody is registered. */
+            bool registered_client = false;
             if (raop->callbacks.check_register) {
                 const unsigned char *pk = data + 4 + X25519_KEY_SIZE;
                 char *pk64 = NULL;
@@ -516,8 +574,10 @@ raop_handler_pairverify(raop_conn_t *conn,
             }
 
             if (!registered_client) {
+                http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
                 return;
             }
+            conn->pin_verified = true;
         }
         *response_data = calloc(1, sizeof(public_key) + sizeof(signature));
         if (*response_data) {
@@ -545,6 +605,22 @@ raop_handler_pairverify(raop_conn_t *conn,
     }
 }
 
+/* In pin mode nothing past pairing is served to a client that has not
+   paired: proved the pin on this connection, or been found registered, and
+   then completed pair-verify. UxPlay's own pin mode only asked honest
+   clients to pair; a client could skip it and go straight to SETUP. */
+static bool
+pin_gate(raop_conn_t *conn, http_response_t *response, const char *what)
+{
+    raop_t *raop = conn->raop;
+    if (!raop->use_pin || (conn->pin_verified && pairing_session_is_verified(conn->session))) {
+        return true;
+    }
+    logger_log(raop->logger, LOGGER_ERR, "%s refused: the client has not paired with the pin", what);
+    http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+    return false;
+}
+
 static void
 raop_handler_fpsetup(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
@@ -553,6 +629,10 @@ raop_handler_fpsetup(raop_conn_t *conn,
     raop_t *raop = conn->raop;  
     const unsigned char *data = NULL;
     int datalen = 0;
+
+    if (!pin_gate(conn, response, "fp-setup")) {
+        return;
+    }
 
     data = (unsigned char *) http_request_get_data(request, &datalen);
     if (datalen == 16) {
@@ -602,6 +682,10 @@ raop_handler_setup(raop_conn_t *conn,
     const char *dacp_id = NULL;
     const char *active_remote_header = NULL;
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
+
+    if (!pin_gate(conn, response, "SETUP")) {
+        return;
+    }
     
     const char *data = NULL;
     int data_len = 0;

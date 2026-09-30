@@ -77,6 +77,8 @@ struct raop_s {
      /* for temporary storage of pin during pair-pin start */
     unsigned short pin;
     bool use_pin;
+    /* when a random pin shown by pair-pin-start stops being accepted */
+    uint64_t pin_expiry;
   
      /* public key as string */
     char pk_str[2*ED25519_KEY_SIZE + 1];
@@ -119,6 +121,9 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+    /* In pin mode: this client proved the pin on this connection, or
+       pair-verify found its key among the registered ones. */
+    bool pin_verified;
 };
 typedef struct raop_conn_s raop_conn_t;
 
