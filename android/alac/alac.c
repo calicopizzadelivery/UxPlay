@@ -233,7 +233,8 @@ static int count_leading_zeros(int32_t input)
 /* for some reason the unrolled version (below) is
  * actually faster than this. yay intel!
  */
-static int count_leading_zeros(int input) { return __builtin_clz(input); }
+/* __builtin_clz(0) is undefined, and the zero-run path asks for it. */
+static int count_leading_zeros(int input) { return input ? __builtin_clz(input) : 32; }
 #elif defined(_MSC_VER) && defined(_M_IX86)
 static int count_leading_zeros(int input) {
   int output = 0;
@@ -385,6 +386,9 @@ static void entropy_rice_decode(alac_file *alac, int32_t *outputBuffer, int outp
 
       // got blockSize 0s
       if (blockSize > 0) {
+        // The run length comes from the stream; never past the frame.
+        if (blockSize > outputSize - outputCount - 1)
+          blockSize = outputSize - outputCount - 1;
         memset(&outputBuffer[outputCount + 1], 0, blockSize * sizeof(*outputBuffer));
         outputCount += blockSize;
       }
@@ -687,6 +691,13 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       /* now read the number of samples,
        * as a 32bit integer */
       outputsamples = readbits(alac, 32);
+      /* The frame names its own length, and every work buffer is sized for
+         setinfo_max_samples_per_frame: bound it by that, not only by the
+         caller's output buffer, or one crafted frame overruns the heap. */
+      if (outputsamples <= 0 || outputsamples > alac->setinfo_max_samples_per_frame) {
+        *outputsize = 0;
+        return;
+      }
       *outputsize = outputsamples * alac->bytespersample;
       if (*outputsize > outbuffer_allocation_size) {
         fprintf(stderr, "FIXME: Not enough space if the output buffer for audio frame - E2.\n");
@@ -695,6 +706,12 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       }
     }
 
+    /* A sample cannot be more uncompressed bytes than it has; allowing it
+       makes readsamplesize negative and walks the bit reader backwards. */
+    if (uncompressed_bytes * 8 >= alac->setinfo_sample_size) {
+      *outputsize = 0;
+      return;
+    }
     readsamplesize = alac->setinfo_sample_size - (uncompressed_bytes * 8);
 
     if (!isnotcompressed) { /* so it is compressed */
@@ -842,6 +859,13 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       /* now read the number of samples,
        * as a 32bit integer */
       outputsamples = readbits(alac, 32);
+      /* The frame names its own length, and every work buffer is sized for
+         setinfo_max_samples_per_frame: bound it by that, not only by the
+         caller's output buffer, or one crafted frame overruns the heap. */
+      if (outputsamples <= 0 || outputsamples > alac->setinfo_max_samples_per_frame) {
+        *outputsize = 0;
+        return;
+      }
       *outputsize = outputsamples * alac->bytespersample;
       if (*outputsize > outbuffer_allocation_size) {
         fprintf(stderr, "FIXME: Not enough space if the output buffer for audio frame - E3.\n");
@@ -850,6 +874,12 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
       }
     }
 
+    /* A sample cannot be more uncompressed bytes than it has; allowing it
+       makes readsamplesize negative and walks the bit reader backwards. */
+    if (uncompressed_bytes * 8 >= alac->setinfo_sample_size) {
+      *outputsize = 0;
+      return;
+    }
     readsamplesize = alac->setinfo_sample_size - (uncompressed_bytes * 8) + 1;
 
     if (!isnotcompressed) { /* compressed */

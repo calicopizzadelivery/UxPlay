@@ -289,6 +289,15 @@ static void cb_mirror_video_running(void *cls, bool running) {
 static pthread_mutex_t g_alac_lock = PTHREAD_MUTEX_INITIALIZER;
 static alac_file *g_alac;
 static int g_alac_spf = 352;
+#define ALAC_MAX_SPF 4096
+/* The decoder's bit reader has no notion of where its input ends, so a short
+   or malformed frame would be read past. Frames are copied into this, zero
+   padded. A channel sample costs at most 9 bits of Rice prefix and 17 of
+   escape, a zero-run code after it 25 more, and 8 uncompressed: 59 bits, so
+   15 bytes covers a stereo sample, and the headers and predictor tables fit
+   in the extra kilobyte. No read of a frame of up to ALAC_MAX_SPF samples
+   leaves it. Guarded by g_alac_lock. */
+static unsigned char g_alac_in[ALAC_MAX_SPF * 15 + 1024];
 
 /* The ALAC stream parameters AirPlay always uses: its fmtp line is
    "96 352 0 16 40 10 14 2 255 0 0 44100", which is also what uxplay.cpp's
@@ -299,7 +308,9 @@ static void alac_reset(int spf) {
         alac_free(g_alac);
     g_alac = alac_create(16, 2);
     if (g_alac != NULL) {
-        g_alac_spf = spf > 0 ? spf : 352;
+        /* From the sender's SETUP. The predictor warm-up writes up to 32
+           samples whatever the frame length, so not below that either. */
+        g_alac_spf = spf >= 64 && spf <= ALAC_MAX_SPF ? spf : 352;
         g_alac->setinfo_max_samples_per_frame = g_alac_spf;
         g_alac->setinfo_7a = 0;
         g_alac->setinfo_sample_size = 16;
@@ -343,14 +354,18 @@ static void cb_audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *da
     if (data->ct == 2) {
         /* ALAC -> interleaved 16-bit stereo, host order, which is what
            AudioTrack's ENCODING_PCM_16BIT wants. */
-        int16_t pcm[4096 * 2];
-        int out_bytes = sizeof(pcm);
+        int16_t pcm[ALAC_MAX_SPF * 2];
         pthread_mutex_lock(&g_alac_lock);
-        if (g_alac == NULL) {
+        if (g_alac == NULL || data->data_len > (int)sizeof(g_alac_in)) {
             pthread_mutex_unlock(&g_alac_lock);
             return;
         }
-        alac_decode_frame(g_alac, data->data, pcm, &out_bytes);
+        memcpy(g_alac_in, data->data, data->data_len);
+        memset(g_alac_in + data->data_len, 0, sizeof(g_alac_in) - data->data_len);
+        /* Exactly one frame's worth, so the decoder's own check refuses a
+           frame that claims more samples than the stream was set up for. */
+        int out_bytes = g_alac_spf * 4;
+        alac_decode_frame(g_alac, g_alac_in, pcm, &out_bytes);
         pthread_mutex_unlock(&g_alac_lock);
         if (out_bytes <= 0)
             return;
