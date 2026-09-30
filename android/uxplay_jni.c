@@ -61,6 +61,7 @@ static jmethodID m_conn_init, m_conn_destroy, m_conn_reset, m_client;
 static jmethodID m_video_codec, m_video_frame, m_video_state, m_video_size, m_mirror_running;
 static jmethodID m_audio_format, m_audio_pcm, m_audio_encoded, m_audio_flush, m_volume;
 static jmethodID m_metadata, m_coverart, m_progress;
+static jmethodID m_pin, m_register_client, m_is_registered;
 
 enum { VIDEO_PAUSE = 1, VIDEO_RESUME = 2, VIDEO_FLUSH = 3, VIDEO_RESET = 4 };
 
@@ -196,7 +197,7 @@ static void cb_conn_feedback(void *cls) { (void)cls; }
 static void cb_report_client_request(void *cls, char *deviceid, char *model, char *name,
                                      bool *admit) {
     (void)cls;
-    *admit = true; /* no access control yet; see pin_pw in uxplay.cpp */
+    *admit = true; /* access control is the pin, enforced before SETUP gets here */
     JNIEnv *env = env_for_thread();
     if (env == NULL || g_host == NULL)
         return;
@@ -208,6 +209,50 @@ static void cb_report_client_request(void *cls, char *deviceid, char *model, cha
     (*env)->DeleteLocalRef(env, jmodel);
     (*env)->DeleteLocalRef(env, jid);
     check_exception(env, "onClient");
+}
+
+/* ----- pin mode: a device pairs once with the pin shown on the TV, and is
+   remembered by its Ed25519 public key (base64) after that. The register
+   lives in the app. */
+
+static void cb_display_pin(void *cls, char *pin) {
+    (void)cls;
+    JNIEnv *env = env_for_thread();
+    if (env == NULL || g_host == NULL)
+        return;
+    jstring jpin = (*env)->NewStringUTF(env, pin ? pin : "");
+    (*env)->CallVoidMethod(env, g_host, m_pin, jpin);
+    (*env)->DeleteLocalRef(env, jpin);
+    check_exception(env, "onPin");
+}
+
+static void cb_register_client(void *cls, const char *device_id, const char *pk, const char *name) {
+    (void)cls;
+    JNIEnv *env = env_for_thread();
+    if (env == NULL || g_host == NULL || pk == NULL)
+        return;
+    jstring jid = (*env)->NewStringUTF(env, device_id ? device_id : "");
+    jstring jpk = (*env)->NewStringUTF(env, pk);
+    jstring jname = name ? (*env)->NewStringUTF(env, name) : NULL;
+    (*env)->CallVoidMethod(env, g_host, m_register_client, jid, jpk, jname);
+    (*env)->DeleteLocalRef(env, jid);
+    (*env)->DeleteLocalRef(env, jpk);
+    if (jname != NULL)
+        (*env)->DeleteLocalRef(env, jname);
+    check_exception(env, "onRegisterClient");
+}
+
+static bool cb_check_register(void *cls, const char *pk) {
+    (void)cls;
+    JNIEnv *env = env_for_thread();
+    if (env == NULL || g_host == NULL || pk == NULL)
+        return false;
+    jstring jpk = (*env)->NewStringUTF(env, pk);
+    jboolean known = (*env)->CallBooleanMethod(env, g_host, m_is_registered, jpk);
+    (*env)->DeleteLocalRef(env, jpk);
+    if (check_exception(env, "isRegistered"))
+        return false;
+    return known == JNI_TRUE;
 }
 
 static void cb_export_dacp(void *cls, const char *active_remote, const char *dacp_id) {
@@ -486,6 +531,10 @@ static bool cache_methods(JNIEnv *env, jobject host) {
     M(m_metadata, "onMetadata", "([B)V");
     M(m_coverart, "onCoverArt", "([B)V");
     M(m_progress, "onProgress", "(JJJ)V");
+    M(m_pin, "onPin", "(Ljava/lang/String;)V");
+    M(m_register_client, "onRegisterClient",
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+    M(m_is_registered, "isRegistered", "(Ljava/lang/String;)Z");
 #undef M
     (*env)->DeleteLocalRef(env, c);
     return true;
@@ -518,7 +567,7 @@ static void stop_locked(void) {
 
 JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
         JNIEnv *env, jobject thiz, jstring jname, jstring jmac, jstring jkeyfile, jint width,
-        jint height, jint refresh, jint max_fps) {
+        jint height, jint refresh, jint max_fps, jboolean require_pin) {
     pthread_mutex_lock(&g_lock);
     if (g_raop != NULL) {
         pthread_mutex_unlock(&g_lock);
@@ -543,7 +592,8 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     }
 
     int err = 0;
-    g_dnssd = dnssd_init(name, strlen(name), hw, sizeof(hw), &err, 0 /* no pin */);
+    /* 1: a pin shown on screen, needed once per device (uxplay's -pin -reg) */
+    g_dnssd = dnssd_init(name, strlen(name), hw, sizeof(hw), &err, require_pin ? 1 : 0);
     if (err || g_dnssd == NULL) {
         ALOGE("dnssd_init failed: %d", err);
         goto fail;
@@ -575,6 +625,9 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     cbs.export_dacp = cb_export_dacp;
     cbs.video_set_codec = cb_video_set_codec;
     cbs.mirror_video_running = cb_mirror_video_running;
+    cbs.display_pin = cb_display_pin;
+    cbs.register_client = cb_register_client;
+    cbs.check_register = cb_check_register;
 
     g_raop = raop_init(&cbs);
     if (g_raop == NULL) {
@@ -593,6 +646,7 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     if (height > 0) raop_set_plist(g_raop, "height", height);
     if (refresh > 0) raop_set_plist(g_raop, "refreshRate", refresh);
     if (max_fps > 0) raop_set_plist(g_raop, "maxFPS", max_fps);
+    if (require_pin) raop_set_plist(g_raop, "pin", 0); /* 0: a new random pin each time */
 
     unsigned short tcp[3] = {0, 0, 0}, udp[3] = {0, 0, 0}; /* 0: assigned */
     raop_set_tcp_ports(g_raop, tcp);
