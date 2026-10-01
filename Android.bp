@@ -7,6 +7,27 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+package {
+    default_applicable_licenses: ["external_uxplay_license"],
+}
+
+// UxPlay and playfair are GPLv3 (playfair's LICENSE.md is the same text);
+// llhttp and the ALAC decoder are MIT. All of it ends up in the image's
+// licence notices through this.
+license {
+    name: "external_uxplay_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-GPL-3.0-or-later",
+        "SPDX-license-identifier-MIT",
+    ],
+    license_text: [
+        "LICENSE",
+        "lib/llhttp/LICENSE-MIT",
+        "android/alac/LICENSE",
+    ],
+}
+
 cc_defaults {
     name: "uxplay_defaults",
     cflags: [
