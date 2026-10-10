@@ -1241,10 +1241,16 @@ raop_handler_set_parameter(raop_conn_t *conn,
 
     content_type = http_request_get_header(request, "Content-Type");
     if (!content_type) {
+        logger_log(raop->logger, LOGGER_WARNING, "SET_PARAMETER with no Content-Type");
         http_response_init(response, "RTSP/1.0", 451, "Parameter not understood");
         return;
     }
     data = http_request_get_data(request, &datalen);
+    /* At INFO deliberately: which parameters a sender actually sends, and
+       when, is the first question in any now-playing or metadata problem, and
+       at DEBUG it is invisible on an image that ships log.tag=I. One line per
+       request, no payload. */
+    logger_log(raop->logger, LOGGER_INFO, "SET_PARAMETER %s, %d bytes", content_type, datalen);
     if (!strcmp(content_type, "text/parameters")) {
         char *datastr = NULL;
         datastr = calloc(1, datalen + 1);
@@ -1282,6 +1288,11 @@ raop_handler_set_parameter(raop_conn_t *conn,
         } else {
             logger_log(raop->logger, LOGGER_WARNING, "RAOP not initialized at SET_PARAMETER metadata");
         }
+    } else {
+        /* The chain had no final else, so a type we do not handle vanished
+           without trace at any log level -- including image/none, which some
+           senders use to say "this track has no artwork". */
+        logger_log(raop->logger, LOGGER_INFO, "SET_PARAMETER: unhandled Content-Type %s", content_type);
     }
 }
 

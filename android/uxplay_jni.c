@@ -24,6 +24,7 @@
 
 #include <android/log.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -635,7 +636,31 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
         goto fail;
     }
     raop_set_log_callback(g_raop, log_callback, NULL);
-    raop_set_log_level(g_raop, LOGGER_INFO);
+    /* INFO is right for a television, but a protocol problem is invisible at
+       that level -- the content type of each SET_PARAMETER, the sizes of the
+       metadata and artwork payloads, and the SRP proofs are all DEBUG. Having
+       to rebuild the image to see them is the wrong trade for a box that is
+       meant to be debugged against real Apple hardware, so:
+           adb shell setprop persist.jetsontv.airplay.debug 1   (then restart)
+       Logcat still filters it out by default; `logcat -s UxPlay:D` shows it. */
+    {
+        char dbg[PROP_VALUE_MAX] = {0};
+        bool want_debug = __system_property_get("persist.jetsontv.airplay.debug", dbg) > 0
+                          && dbg[0] != '0' && strcmp(dbg, "false") != 0;
+        raop_set_log_level(g_raop, want_debug ? LOGGER_DEBUG : LOGGER_INFO);
+        if (want_debug) {
+            /* Raising the library's own level is not enough. The image ships
+               a global log.tag=I (device/nvidia/tegra-common/properties.mk,
+               every variant but eng), and liblog drops ANDROID_LOG_DEBUG
+               writes inside this process, before logd and so before any
+               logcat filter could get them back. liblog takes the lower of
+               that property and the process minimum, so lowering the process
+               minimum is what lets DEBUG through. Process-wide rather than
+               per-tag, which is fair for a switch that exists to debug. */
+            __android_log_set_minimum_priority(ANDROID_LOG_VERBOSE);
+            ALOGI("UxPlay logging at DEBUG (persist.jetsontv.airplay.debug)");
+        }
+    }
     /* nohold: a new sender may take over from a connected one, which is what
        a shared television wants. */
     if (raop_init2(g_raop, 1, mac, keyfile)) {
