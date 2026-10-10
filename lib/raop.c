@@ -79,6 +79,15 @@ struct raop_s {
     bool use_pin;
     /* when a random pin shown by pair-pin-start stops being accepted */
     uint64_t pin_expiry;
+    /* Guesses left against the code now on screen. Counts rejected proofs,
+       not step-1s: a client that starts and wanders off costs nothing, and
+       this is the only point where a mistype is distinguishable. */
+    int pin_attempts;
+    /* Bumped whenever a new code is rolled. A connection records the value
+       it armed its SRP verifier under, and step 2 refuses a mismatch, so the
+       budget bounds comparisons rather than arms -- without this an armed
+       verifier could be re-driven for more guesses than the budget allows. */
+    unsigned int pin_generation;
   
      /* public key as string */
     char pk_str[2*ED25519_KEY_SIZE + 1];
@@ -121,6 +130,10 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+    /* The pin generation this connection armed its SRP verifier under; see
+       raop_t.pin_generation. 0 means it never completed step 1. */
+    unsigned int pin_generation;
+
     /* In pin mode: this client proved the pin on this connection, or
        pair-verify found its key among the registered ones. */
     bool pin_verified;
@@ -629,6 +642,8 @@ raop_init(raop_callbacks_t *callbacks) {
     /* initialise stored pin */
     raop->pin = 0;
     raop->use_pin = false;
+    raop->pin_attempts = 0;
+    raop->pin_generation = 0;
 
     /* initialize switch for display of client's streaming data records */    
     raop->clientFPSdata = 0;

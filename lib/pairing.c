@@ -577,7 +577,7 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
        below release session->srp: without this, a client that repeats a
        rejected request dereferences NULL */
     if (!session || !session->srp) {
-        return -1;
+        return -4;  /* nothing armed: no proof was compared */
     }
     b = session->srp->private_key;
 
@@ -588,8 +588,13 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
                                                     b, len_b,
                                                     &B, &len_B, NULL, NULL, 1);
     if (!verifier) {
-        /* the SRP-6a safety check rejected the client's <A> */
-        return -1;
+        /* The SRP-6a safety check rejected the client's <A>. No proof was
+           compared, so this must not spend a pin attempt -- otherwise a
+           peer could exhaust the budget without ever guessing. Release the
+           armed state so the same session cannot be re-driven. */
+        free (session->srp);
+        session->srp = NULL;
+        return -4;
     }
 
     /* <M> and <M1> are each one SRP_SHA digest. srp.c builds the session key
@@ -633,7 +638,7 @@ srp_confirm_pair_setup(pairing_session_t *session, pairing_t *pairing,
     /* decrypt client epk to get client pk, authenticate with auth_tag*/ 
 
     if (!session || !session->srp) {
-        return -1;
+        return -4;  /* nothing armed: no proof was compared */
     }
 
     const char *salt = "Pair-Setup-AES-Key";

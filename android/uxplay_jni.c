@@ -61,7 +61,7 @@ static jmethodID m_conn_init, m_conn_destroy, m_conn_reset, m_client;
 static jmethodID m_video_codec, m_video_frame, m_video_state, m_video_size, m_mirror_running;
 static jmethodID m_audio_format, m_audio_pcm, m_audio_encoded, m_audio_flush, m_volume;
 static jmethodID m_metadata, m_coverart, m_progress;
-static jmethodID m_pin, m_register_client, m_is_registered;
+static jmethodID m_pin, m_pin_rejected, m_register_client, m_is_registered;
 
 enum { VIDEO_PAUSE = 1, VIDEO_RESUME = 2, VIDEO_FLUSH = 3, VIDEO_RESET = 4 };
 
@@ -225,6 +225,15 @@ static void cb_display_pin(void *cls, char *pin) {
     (*env)->DeleteLocalRef(env, jpin);
     check_exception(env, "onPin");
 }
+static void cb_pin_rejected(void *cls, int attempts_left) {
+    (void)cls;
+    JNIEnv *env = env_for_thread();
+    if (env == NULL || g_host == NULL)
+        return;
+    (*env)->CallVoidMethod(env, g_host, m_pin_rejected, (jint) attempts_left);
+    check_exception(env, "onPinRejected");
+}
+
 
 static void cb_register_client(void *cls, const char *device_id, const char *pk, const char *name) {
     (void)cls;
@@ -532,6 +541,7 @@ static bool cache_methods(JNIEnv *env, jobject host) {
     M(m_coverart, "onCoverArt", "([B)V");
     M(m_progress, "onProgress", "(JJJ)V");
     M(m_pin, "onPin", "(Ljava/lang/String;)V");
+    M(m_pin_rejected, "onPinRejected", "(I)V");
     M(m_register_client, "onRegisterClient",
       "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
     M(m_is_registered, "isRegistered", "(Ljava/lang/String;)Z");
@@ -626,6 +636,7 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     cbs.video_set_codec = cb_video_set_codec;
     cbs.mirror_video_running = cb_mirror_video_running;
     cbs.display_pin = cb_display_pin;
+    cbs.pin_rejected = cb_pin_rejected;
     cbs.register_client = cb_register_client;
     cbs.check_register = cb_check_register;
 

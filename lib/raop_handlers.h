@@ -40,6 +40,17 @@ static uint64_t pin_clock_ns(void) {
 #define SECOND_IN_NSECS 1000000000
 #define MAX_PW_ATTEMPTS 3
 
+/* Guesses allowed against one displayed code. A four-digit code read off a
+   television and typed on a phone is mistyped often, and before this a single
+   slip retired the code with no way back. Three is the same budget this file
+   already uses for passwords above.
+
+   The budget bounds guesses per code; it does not bound codes. pair-pin-start
+   is unauthenticated and unthrottled, so an attacker on the LAN can roll fresh
+   codes without limit -- see docs/airplay.md, "The PIN gate". This is a
+   usability fix with a bounded cost, not the thing that makes pairing safe. */
+#define MAX_PIN_ATTEMPTS 3
+
 typedef void (*raop_handler_t)(raop_conn_t *, http_request_t *,
                                http_response_t *, char **, int *);
 
@@ -280,6 +291,12 @@ raop_handler_pairpinstart(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
         } else {
             raop->pin = (unsigned short) pin_4 % 10000;
+            /* Only on the branch that actually rolls a code, and together
+               with the generation bump, so no future edit can re-arm the
+               budget over a code already on screen. A fixed pin set by
+               raop_set_plist is not re-armed here. */
+            raop->pin_attempts = MAX_PIN_ATTEMPTS;
+            raop->pin_generation++;
         }
     }
     char pin[6] = { '\0' };
@@ -346,7 +363,9 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         /* A random pin exists only between pair-pin-start and its first use.
            Without this check a client that never asked for one paired with
            "0000", which is what raop->pin % 10000 is when none is pending. */
-        if (raop->pin < 10000 && (!raop->use_pin || raop->pin == 0 || pin_clock_ns() > raop->pin_expiry)) {
+        if (raop->pin < 10000 && (!raop->use_pin || raop->pin == 0
+                                  || raop->pin_attempts <= 0
+                                  || pin_clock_ns() > raop->pin_expiry)) {
             logger_log(raop->logger, LOGGER_ERR, "pair-setup-pin with no pin on screen: refused");
             raop->pin = 0;
             plist_mem_free(user);
@@ -354,9 +373,12 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             goto authentication_failed;
         }
         snprintf(pin, 6, "%04u", raop->pin % 10000);
-        if (raop->pin < 10000) {
-            raop->pin = 0;
-        }
+        /* The code is NOT retired here. This is step 1, the salt and public
+           key exchange; the client's proof does not arrive until step 2, so
+           retiring it here burned the code on every outcome and made a
+           mistype unrecoverable. It is retired in exactly three places: a
+           proof accepted (step 3), the budget spent, and the guard above. */
+        conn->pin_generation = raop->pin_generation;
         int ret = srp_new_user(conn->session, raop->pairing, (const char *) user,
                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
         plist_mem_free(user);
@@ -404,6 +426,17 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         }
         memcpy(proof, client_proof, (size_t) client_proof_len);
         free (client_proof);
+        /* The budget is enforced HERE, where the secret is compared, and not
+           only at step 1 where the verifier is armed. Gating the arm alone
+           would let one armed verifier be re-driven across connections for
+           more guesses than the budget allows. */
+        if (raop->use_pin && conn->pin_generation != raop->pin_generation) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "pair-setup-pin: proof offered against a retired code: refused");
+            free (client_pk);
+            plist_free(req_root_node);
+            goto authentication_failed;
+        }
         int ret = srp_validate_proof(conn->session, raop->pairing, (const unsigned char *) client_pk,
                                      (int) client_pk_len, proof, (int) client_proof_len, &proof_len);
         free (client_pk);
@@ -411,6 +444,21 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         if (ret == -3) {
             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client_proof_len %d invalid)", (int) client_proof_len);
             goto authentication_failed;
+        }
+        if (ret == -1 && raop->use_pin && raop->pin_attempts > 0) {
+            /* -1 alone means a proof was compared and rejected: a real guess.
+               -2 and -4 are a bad key length and "nothing was armed", neither
+               of which is one, so they must not spend the budget. */
+            raop->pin_attempts--;
+            conn->pin_generation = 0;
+            logger_log(raop->logger, LOGGER_ERR,
+                       "pair-setup-pin: wrong code, %d attempt(s) left", raop->pin_attempts);
+            if (raop->pin_attempts <= 0) {
+                raop->pin = 0;   /* retired: the next client must ask again */
+            }
+            if (raop->callbacks.pin_rejected) {
+                raop->callbacks.pin_rejected(raop->callbacks.cls, raop->pin_attempts);
+            }
         }
         if (ret < 0) {
             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client proof not validated)");
@@ -471,6 +519,11 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         }
         pairing_session_set_setup_status(conn->session);
         conn->pin_verified = true;
+        /* Proved. Retire the code so it cannot be replayed, and disarm the
+           budget: the next client must ask for a new one. */
+        raop->pin = 0;
+        raop->pin_attempts = 0;
+        raop->pin_generation++;
         /* Remember it as soon as it has proved the pin, not only if it goes
            on to stream; SETUP registers it again with its name. */
         if (raop->callbacks.register_client) {

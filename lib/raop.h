@@ -98,6 +98,10 @@ struct raop_callbacks_s {
     void  (*mirror_video_running)(void *cls, bool is_running);
     void  (*report_client_request) (void *cls, char *deviceid, char *model, char *name, bool *admit);
     void  (*display_pin) (void *cls, char * pin);
+    /* A code was compared and rejected. attempts_left is how many guesses
+       remain against the code on screen; 0 means it has been retired and the
+       client must ask for a new one. */
+    void  (*pin_rejected) (void *cls, int attempts_left);
     void  (*register_client) (void *cls, const char *device_id, const char *pk_str, const char *name);
     bool  (*check_register) (void *cls, const char *pk_str);
     const char*  (*passwd) (void *cls, int *len);
