@@ -385,8 +385,16 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         uint64_t client_proof_len = 0;
         plist_get_data_val(req_pk_node, &client_pk, &client_pk_len); 
         plist_get_data_val(req_proof_node, &client_proof, &client_proof_len);
-        if (client_proof_len != sizeof(proof)) {
+        int proof_len = (int) sizeof(proof);
+        /* Only a capacity bound here: the exact length is one SRP_SHA digest,
+           which srp_validate_proof knows and this function does not. The copy
+           below takes client_proof_len bytes, so it can neither overrun
+           proof[] nor read past what libplist allocated. */
+        if (client_proof_len > sizeof(proof)) {
             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client_proof_len %d invalid)", (int) client_proof_len);
+            free (client_proof);
+            free (client_pk);
+            plist_free(req_root_node);
             goto authentication_failed;
         }
         if (logger_debug) {
@@ -394,23 +402,27 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_DEBUG, "client SRP6a proof <M> :\n%s", str);	    
             free (str);
         }
-        memcpy(proof, client_proof, sizeof(proof));
+        memcpy(proof, client_proof, (size_t) client_proof_len);
         free (client_proof);
         int ret = srp_validate_proof(conn->session, raop->pairing, (const unsigned char *) client_pk,
-                                     (int) client_pk_len, proof, (int) client_proof_len, (int) sizeof(proof));
+                                     (int) client_pk_len, proof, (int) client_proof_len, &proof_len);
         free (client_pk);
         plist_free(req_root_node);
+        if (ret == -3) {
+            logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client_proof_len %d invalid)", (int) client_proof_len);
+            goto authentication_failed;
+        }
         if (ret < 0) {
             logger_log(raop->logger, LOGGER_ERR, "Client Authentication Failure (client proof not validated)");
             goto authentication_failed;
         }
         if (logger_debug) {
-	    char *str = utils_data_to_string((const unsigned char *) proof, sizeof(proof), 20);
+	    char *str = utils_data_to_string((const unsigned char *) proof, proof_len, 20);
             logger_log(raop->logger, LOGGER_DEBUG, "server SRP6a proof <M1> :\n%s", str);
             free (str);
         }
         plist_t res_root_node = plist_new_dict();
-        plist_t res_proof_node = plist_new_data((const char *) proof, 20);
+        plist_t res_proof_node = plist_new_data((const char *) proof, proof_len);
         plist_dict_set_item(res_root_node, "proof", res_proof_node);	
         plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
         plist_free(res_root_node);

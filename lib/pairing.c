@@ -562,15 +562,24 @@ srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_
 
 int
 srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigned char *A,
-                    int len_A, unsigned char *proof, int client_proof_len, int proof_len) {
+                    int len_A, unsigned char *proof, int client_proof_len, int *proof_len) {
     int authenticated  = 0;
     const unsigned char *B =  NULL;
-    const unsigned char *b = session->srp->private_key;
+    const unsigned char *b = NULL;
     int len_b = SRP_PRIVATE_KEY_SIZE;
     int len_B = 0;
     int len_K = 0;
+    int len_M = 0;
     const unsigned char *session_key  = NULL;
     const unsigned char *M2 = NULL;
+
+    /* step 2 can arrive without a preceding step 1, and the failure paths
+       below release session->srp: without this, a client that repeats a
+       rejected request dereferences NULL */
+    if (!session || !session->srp) {
+        return -1;
+    }
+    b = session->srp->private_key;
 
     struct SRPVerifier *verifier = srp_verifier_new(SRP_SHA, SRP_NG, (const char *) session->username,
                                                     (const unsigned char *) session->srp->salt, SRP_SALT_SIZE,
@@ -578,6 +587,22 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
                                                     A, len_A,
                                                     b, len_b,
                                                     &B, &len_B, NULL, NULL, 1);
+    if (!verifier) {
+        /* the SRP-6a safety check rejected the client's <A> */
+        return -1;
+    }
+
+    /* <M> and <M1> are each one SRP_SHA digest. srp.c builds the session key
+       from two of them (APPLE_VARIANT), so this tracks whatever SRP_SHA is
+       set to instead of assuming a hash size here. */
+    len_M = srp_verifier_get_session_key_length(verifier) / 2;
+    if (client_proof_len != len_M || *proof_len < len_M) {
+        /* -3, not -1: a malformed length is not a failed authentication, and
+           the caller logs it. Leave session->srp intact so a client that
+           retries gets another 470 rather than a crash. */
+        srp_verifier_delete(verifier);
+        return -3;
+    }
 
     srp_verifier_verify_session(verifier, proof, &M2);
     authenticated = srp_verifier_is_authenticated(verifier);
@@ -590,10 +615,12 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
     }
     session_key = srp_verifier_get_session_key(verifier, &len_K);
     if (len_K != SRP_SESSION_KEY_SIZE) {
+        srp_verifier_delete(verifier);
         return -2;
     }
     memcpy(session->srp->session_key, session_key, len_K);
-    memcpy(proof, M2, proof_len);
+    memcpy(proof, M2, len_M);
+    *proof_len = len_M;
     srp_verifier_delete(verifier);
     return 0;
 }
@@ -604,6 +631,10 @@ srp_confirm_pair_setup(pairing_session_t *session, pairing_t *pairing,
     unsigned char hash[SHA512_DIGEST_LENGTH] = {0};
     unsigned char pk[ED25519_KEY_SIZE] = {0};
     /* decrypt client epk to get client pk, authenticate with auth_tag*/ 
+
+    if (!session || !session->srp) {
+        return -1;
+    }
 
     const char *salt = "Pair-Setup-AES-Key";
     sha_ctx_t *ctx = sha_init();
