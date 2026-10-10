@@ -746,6 +746,11 @@ raop_rtp_set_coverart(raop_rtp_t *raop_rtp, const char *data, int datalen)
 
     /* Set coverart in thread instead */
     MUTEX_LOCK(raop_rtp->run_mutex);
+    if (raop_rtp->coverart) {
+        /* A second cover before the thread drained the first leaked it.
+           raop_rtp_set_metadata already does this; this one did not. */
+        free (raop_rtp->coverart);
+    }
     raop_rtp->coverart = coverart;
     raop_rtp->coverart_len = datalen;
     MUTEX_UNLOCK(raop_rtp->run_mutex);

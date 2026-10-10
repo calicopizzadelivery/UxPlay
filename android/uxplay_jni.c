@@ -24,7 +24,6 @@
 
 #include <android/log.h>
 #include <jni.h>
-#include <sys/system_properties.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -636,33 +635,28 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
         goto fail;
     }
     raop_set_log_callback(g_raop, log_callback, NULL);
-    /* INFO is right for a television, but a protocol problem is invisible at
-       that level -- the content type of each SET_PARAMETER, the sizes of the
-       metadata and artwork payloads, and the SRP proofs are all DEBUG. Having
-       to rebuild the image to see them is the wrong trade for a box that is
-       meant to be debugged against real Apple hardware, so:
-           adb shell setprop persist.jetsontv.airplay.debug 1   (then restart)
-       Logcat still filters it out by default; `logcat -s UxPlay:D` shows it. */
-    {
-        char dbg[PROP_VALUE_MAX] = {0};
-        bool want_debug = __system_property_get("persist.jetsontv.airplay.debug", dbg) > 0
-                          && dbg[0] != '0' && strcmp(dbg, "false") != 0;
-        raop_set_log_level(g_raop, want_debug ? LOGGER_DEBUG : LOGGER_INFO);
-        if (want_debug) {
-            /* Raising the library's own level is not enough. The image ships
-               a global log.tag=I (device/nvidia/tegra-common/properties.mk,
-               every variant but eng), and liblog drops ANDROID_LOG_DEBUG
-               writes inside this process, before logd and so before any
-               logcat filter could get them back. liblog takes the lower of
-               that property and the process minimum, so lowering the process
-               minimum is what lets DEBUG through. Process-wide rather than
-               per-tag, which is fair for a switch that exists to debug. */
-            __android_log_set_minimum_priority(ANDROID_LOG_VERBOSE);
-            ALOGI("UxPlay logging at DEBUG (persist.jetsontv.airplay.debug)");
-        }
-    }
-    /* nohold: a new sender may take over from a connected one, which is what
-       a shared television wants. */
+    /*
+     * INFO, and deliberately not switchable from a property.
+     *
+     * An earlier version of this file read persist.jetsontv.airplay.debug and
+     * raised the library to LOGGER_DEBUG, then lifted liblog's process
+     * minimum to VERBOSE to get past the image's global log.tag=I. It worked,
+     * and it was a bad idea: UxPlay's DEBUG path prints the SRP proofs
+     * (raop_handlers.h:402, :421), the 16-byte AES-CBC iv and the
+     * fairplay-decrypted audio key (:898, :918), the ECDH shared secret, and
+     * raw request bodies. The log.tag=I gate is the only thing keeping that
+     * out of logcat. Worse, the property persisted and the receiver starts
+     * from BOOT_COMPLETED, so a bench box would have sat printing session
+     * keys across reboots whether or not anything was streaming.
+     *
+     * Nothing was lost by removing it. What a now-playing or metadata problem
+     * actually needs is which parameters the sender sends and when, and that
+     * is logged at INFO in raop_handler_set_parameter, where log.tag=I passes
+     * it. If a future question genuinely needs DEBUG, redact those lines
+     * first, scope it to a session rather than to a persisted property, and
+     * do not lift the process-wide minimum.
+     */
+    raop_set_log_level(g_raop, LOGGER_INFO);
     if (raop_init2(g_raop, 1, mac, keyfile)) {
         ALOGE("raop_init2 failed");
         goto fail;
