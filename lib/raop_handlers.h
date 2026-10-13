@@ -42,14 +42,27 @@ static uint64_t pin_clock_ns(void) {
 
 /* Guesses allowed against one displayed code. A four-digit code read off a
    television and typed on a phone is mistyped often, and before this a single
-   slip retired the code with no way back. Three is the same budget this file
-   already uses for passwords above.
+   slip retired the code with no way back.
+
+   Four, not three, because the sender spends one by itself. A device that was
+   paired before still holds the old password, so when the receiver forgets it
+   the sender submits that saved one the instant a code appears -- measured at
+   108 ms after PAIR-PIN-START, long before anyone could read four digits off
+   a screen -- and only prompts the person once it is refused. Three therefore
+   gave a human two, and exactly in the situation where someone is most likely
+   to be re-pairing. Four gives a human three.
+
+   The cost is small and was computed rather than assumed: with random_pin()'s
+   modulo bias the best single guess is 7/65529, so per displayed code this
+   moves 1 in 3,120 to 1 in 2,340. It does not change guesses per second at
+   all, because a rejected proof releases the SRP state and every guess needs
+   its own step 1 regardless of the budget.
 
    The budget bounds guesses per code; it does not bound codes. pair-pin-start
    is unauthenticated and unthrottled, so an attacker on the LAN can roll fresh
    codes without limit -- see docs/airplay.md, "The PIN gate". This is a
    usability fix with a bounded cost, not the thing that makes pairing safe. */
-#define MAX_PIN_ATTEMPTS 3
+#define MAX_PIN_ATTEMPTS 4
 
 typedef void (*raop_handler_t)(raop_conn_t *, http_request_t *,
                                http_response_t *, char **, int *);
