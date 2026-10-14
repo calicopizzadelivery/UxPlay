@@ -180,7 +180,11 @@ raop_handler_info(raop_conn_t *conn,
     plist_t vv_node = plist_new_uint(strtol(AIRPLAY_VV, NULL, 10));
     plist_dict_set_item(res_node, "vv", vv_node);
 
-    plist_t status_flags_node = plist_new_uint(68);
+    /* 68 is 0x44. Bit 3 (0x08) is "pin required", and a receiver that asks
+       for a code has to say so here as well as in its mDNS TXT -- a sender
+       reads whichever it reaches first, and the two disagreeing is worse than
+       either being wrong. Upstream hard-codes 68 in every mode. */
+    plist_t status_flags_node = plist_new_uint(conn->raop->use_pin ? 68 | 0x08 : 68);
     plist_dict_set_item(res_node, "statusFlags", status_flags_node);
 
     plist_t keep_alive_low_power_node = plist_new_uint(1);
