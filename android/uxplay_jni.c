@@ -577,7 +577,8 @@ static void stop_locked(void) {
 
 JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
         JNIEnv *env, jobject thiz, jstring jname, jstring jmac, jstring jkeyfile, jint width,
-        jint height, jint refresh, jint max_fps, jboolean require_pin) {
+        jint height, jint refresh, jint max_fps, jboolean require_pin,
+        jboolean open_audio) {
     pthread_mutex_lock(&g_lock);
     if (g_raop != NULL) {
         pthread_mutex_unlock(&g_lock);
@@ -677,6 +678,7 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     if (refresh > 0) raop_set_plist(g_raop, "refreshRate", refresh);
     if (max_fps > 0) raop_set_plist(g_raop, "maxFPS", max_fps);
     if (require_pin) raop_set_plist(g_raop, "pin", 0); /* 0: a new random pin each time */
+    raop_set_plist(g_raop, "open_audio", open_audio ? 1 : 0);
 
     unsigned short tcp[3] = {0, 0, 0}, udp[3] = {0, 0, 0}; /* 0: assigned */
     raop_set_tcp_ports(g_raop, tcp);

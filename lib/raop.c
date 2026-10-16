@@ -77,6 +77,14 @@ struct raop_s {
      /* for temporary storage of pin during pair-pin start */
     unsigned short pin;
     bool use_pin;
+    /* Let an UNPAIRED sender play audio, but never mirror. macOS Apple Music
+       opens with fp-setup and never pairs, so without this the box cannot be
+       used as a speaker at all while the pin is on. ON by default: the
+       exposure is bounded by the LAN -- AirPlay here has no Bluetooth or AWDL
+       transport, so a sender must already be on the network -- and losing the
+       commonest use of the feature is the worse trade. The owner can turn it
+       off to require the code for audio as well. See docs/airplay.md. */
+    bool open_audio;
     /* when a random pin shown by pair-pin-start stops being accepted */
     uint64_t pin_expiry;
     /* Guesses left against the code now on screen. Counts rejected proofs,
@@ -644,6 +652,7 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->use_pin = false;
     raop->pin_attempts = 0;
     raop->pin_generation = 0;
+    raop->open_audio = true;
 
     /* initialize switch for display of client's streaming data records */    
     raop->clientFPSdata = 0;
@@ -781,6 +790,8 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
             raop->audio_delay_micros = value;
         }
         if (raop->audio_delay_micros != value) retval = 1;
+    } else if (strcmp(plist_item, "open_audio") == 0) {
+        raop->open_audio = (value != 0);
     } else if (strcmp(plist_item, "pin") == 0) {
         raop->pin = value;
         raop->use_pin = true;

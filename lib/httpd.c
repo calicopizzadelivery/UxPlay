@@ -572,13 +572,25 @@ httpd_thread(void *arg)
             if (http_request_is_complete(connection->request)) {
                 http_response_t *response = NULL;
                 // Callback the received data to raop
-                if (logger_debug) {
+                {
+                    /* At INFO, not behind logger_debug. Which requests a
+                       sender makes, and in what order, is the first question
+                       in every protocol problem this receiver has had, and
+                       DEBUG is unavailable on an image that ships log.tag=I
+                       and would print session keys if it were not. The two
+                       periodic requests are skipped so a running stream does
+                       not drown it: /feedback arrives about every two seconds
+                       and GET_PARAMETER polls the volume. */
                     const char *method = http_request_get_method(connection->request);
                     const char *url = http_request_get_url(connection->request);
                     const char *protocol = http_request_get_protocol(connection->request);
-                    logger_log(httpd->logger, LOGGER_INFO, "httpd request received on socket %d, "
-                               "connection %d, method = %s, url = %s, protocol = %s",
-                               connection->socket_fd, i, method, url, protocol);
+                    bool chatty = (url && strstr(url, "/feedback"))
+                                  || (method && !strcmp(method, "GET_PARAMETER"));
+                    if (!chatty) {
+                        logger_log(httpd->logger, LOGGER_INFO, "%s %s (%s) on socket %d",
+                                   method ? method : "?", url ? url : "?",
+                                   protocol ? protocol : "?", connection->socket_fd);
+                    }
                 }
                 httpd->callbacks.conn_request(connection->user_data, connection->request, &response);
                 http_request_destroy(connection->request);

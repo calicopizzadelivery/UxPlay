@@ -691,11 +691,32 @@ raop_handler_pairverify(raop_conn_t *conn,
    paired: proved the pin on this connection, or been found registered, and
    then completed pair-verify. UxPlay's own pin mode only asked honest
    clients to pair; a client could skip it and go straight to SETUP. */
+/** True when this connection has proved the pin on this connection. */
+static bool
+pin_proved(raop_conn_t *conn)
+{
+    return conn->pin_verified && pairing_session_is_verified(conn->session);
+}
+
 static bool
 pin_gate(raop_conn_t *conn, http_response_t *response, const char *what)
 {
     raop_t *raop = conn->raop;
-    if (!raop->use_pin || (conn->pin_verified && pairing_session_is_verified(conn->session))) {
+    if (!raop->use_pin || pin_proved(conn)) {
+        return true;
+    }
+    if (raop->open_audio) {
+        /* Deferred, not waived. An unpaired sender is let past fp-setup and
+           the front of SETUP so that an audio-only client -- macOS Apple
+           Music opens with fp-setup and never pairs -- can get as far as
+           declaring what it wants. The mirroring stream type is refused
+           inside the streams loop, which is the first point at which the
+           request says which it is.
+
+           What that costs is real and is not only audio: an unpaired device
+           also reaches the FairPlay key exchange and the RTP and NTP setup
+           that precede the loop, and can push metadata, artwork and volume.
+           It cannot mirror. Off by default for that reason. */
         return true;
     }
     logger_log(raop->logger, LOGGER_ERR, "%s refused: the client has not paired with the pin", what);
@@ -1131,6 +1152,20 @@ raop_handler_setup(raop_conn_t *conn,
             switch (type) {
             case 110: {
                 // Mirroring
+                if (raop->use_pin && !pin_proved(conn)) {
+                    /* Only reachable with open_audio on: the gate above let
+                       this connection through without a pin so that audio
+                       could work. Mirroring is not part of that bargain, and
+                       this is the first point where the request says which it
+                       is -- so the exemption cannot be something the sender
+                       chooses by declaring itself audio-only. */
+                    logger_log(raop->logger, LOGGER_ERR,
+                               "SETUP: mirroring refused, the client has not paired with the pin");
+                    http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+                    plist_free(req_root_node);
+                    plist_free(res_streams_node);
+                    return;
+                }
                 raop_destroy_airplay_video(raop, -1);  //cleanup any hls data still present when mirror video starts
                 unsigned short dport = raop->mirror_data_lport;
                 plist_t stream_id_node = plist_dict_get_item(req_stream_node, "streamConnectionID");
