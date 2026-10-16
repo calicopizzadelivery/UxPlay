@@ -716,7 +716,13 @@ pin_gate(raop_conn_t *conn, http_response_t *response, const char *what)
            What that costs is real and is not only audio: an unpaired device
            also reaches the FairPlay key exchange and the RTP and NTP setup
            that precede the loop, and can push metadata, artwork and volume.
-           It cannot mirror. Off by default for that reason. */
+           It cannot mirror.
+
+           On by default, which was the user's call: the exposure is bounded
+           by the LAN, because AirPlay here has no Bluetooth and no AWDL
+           transport, and a television that silently refuses Apple Music is
+           the worse failure. "Allow audio without a code" in Settings >
+           System > AirPlay turns it off for anyone who disagrees. */
         return true;
     }
     logger_log(raop->logger, LOGGER_ERR, "%s refused: the client has not paired with the pin", what);
@@ -738,6 +744,8 @@ raop_handler_fpsetup(raop_conn_t *conn,
     }
 
     data = (unsigned char *) http_request_get_data(request, &datalen);
+    logger_log(raop->logger, LOGGER_INFO, "fp-setup: %d bytes, type 0x%02x",
+               datalen, datalen >= 5 ? data[4] : 0);
     if (datalen == 16) {
         *response_data = calloc(142, sizeof(char));
         if (*response_data) {
@@ -745,7 +753,9 @@ raop_handler_fpsetup(raop_conn_t *conn,
             if (!fairplay_setup(conn->fairplay, data, (unsigned char *) *response_data)) {
                 *response_datalen = 142;
             } else {
-                // Handle error?
+                /* An empty body here is what the sender sees, and it reports
+                   it as an incompatible receiver. fairplay_setup says why. */
+                logger_log(raop->logger, LOGGER_ERR, "fp-setup stage 1 failed, answering empty");
                 free(*response_data);
                 *response_data = NULL;
             }
@@ -757,7 +767,7 @@ raop_handler_fpsetup(raop_conn_t *conn,
             if (!fairplay_handshake(conn->fairplay, data, (unsigned char *) *response_data)) {
                 *response_datalen = 32;
             } else {
-                // Handle error?
+                logger_log(raop->logger, LOGGER_ERR, "fp-setup stage 2 failed, answering empty");
                 free(*response_data);
                 *response_data = NULL;
             }
