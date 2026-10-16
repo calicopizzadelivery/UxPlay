@@ -51,14 +51,26 @@ fairplay_setup(fairplay_t *fp, const unsigned char req[16], unsigned char res[14
     assert(fp);
 
     if (req[4] != 0x03) {
-        /* Unsupported fairplay version */
-        return -1;
+        /* Warn, but answer anyway, which is what shairport-sync does:
+           rtsp.c handle_fp_setup logs "Unsupported FP version." and falls
+           through to the same reply table.
+
+           That is defensible because nothing here is computed from the
+           version. The four replies are static blobs captured from an Apple
+           TV -- shairport's server_fp_reply1..4 are byte for byte identical
+           to these -- so refusing on the version withholds an answer that
+           does not depend on it. macOS Apple Music asks for type 0x02 and
+           got an empty body, which it reports as an incompatible receiver. */
+        logger_log(fp->logger, LOGGER_WARNING,
+                   "fp-setup: FairPlay type 0x%02x, answering with the 0x03 reply",
+                   req[4]);
     }
 
     /* The mode is the client's byte, and there are four replies: without
        this, any client could read up to 36 KB past the table. */
     int mode = req[14];
     if (mode >= (int) (sizeof(reply_message) / sizeof(reply_message[0]))) {
+        logger_log(fp->logger, LOGGER_ERR, "fp-setup: mode %d out of range", mode);
         return -1;
     }
     memcpy(res, reply_message[mode], 142);
@@ -72,8 +84,11 @@ fairplay_handshake(fairplay_t *fp, const unsigned char req[164], unsigned char r
     assert(fp);
 
     if (req[4] != 0x03) {
-        /* Unsupported fairplay version */
-        return -1;
+        /* Same reasoning as fairplay_setup: the reply is a fixed header plus
+           20 bytes echoed from the request, with nothing derived from the
+           version. */
+        logger_log(fp->logger, LOGGER_WARNING,
+                   "fp-handshake: FairPlay type 0x%02x, answering anyway", req[4]);
     }
 
     memcpy(fp->keymsg, req, 164);
