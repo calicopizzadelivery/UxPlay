@@ -783,7 +783,420 @@ raop_handler_options(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
                      char **response_data, int *response_datalen)
 {
-    http_response_add_header(response, "Public", "SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+}
+
+/* ---------------------------------------------------------------------------
+   Classic AirPlay 1 / RAOP.
+
+   macOS drives every audio-only session this way -- Apple Music's AirPlay menu
+   and Sound > Output alike -- while using AirPlay 2 for mirroring from the same
+   machine. The shapes differ completely: AirPlay 2 carries the session key and
+   the stream parameters in SETUP's own binary plist, where classic RAOP sends
+   SDP in an ANNOUNCE first and then a SETUP whose parameters are in a
+   "Transport:" request header with no body at all.
+
+   What it does NOT need, which is the whole reason this is implementable:
+   macOS sends "a=fpaeskey", a 72-byte FairPlay-wrapped key that
+   fairplay_decrypt() already takes, on a connection that has just completed
+   both fp-setup stages. shairport-sync parses "a=rsaaeskey" instead and needs
+   Apple's leaked AirPort Express private RSA key to unwrap it; we need no RSA
+   at all, and no Apple-Challenge either -- macOS sends none. Verified on the
+   wire 2026-10-17; see docs/airplay.md.
+
+   Classic RAOP has no mirroring stream, so a session on this path is audio by
+   construction rather than by the sender's say-so. That is why it sits behind
+   the same pin_gate as everything else and needs no separate refusal.
+   --------------------------------------------------------------------------- */
+
+/** Decode base64 into out, returning the byte count, or -1 on anything
+    unexpected. SDP carries base64 unpadded, so '=' is tolerated but not
+    required, and any other stray character is a refusal rather than a guess:
+    this is network data from an unauthenticated sender. */
+static int
+raop_base64_decode(const char *in, int in_len, unsigned char *out, int out_max)
+{
+    static const signed char T[256] = {
+        ['A']= 0,['B']= 1,['C']= 2,['D']= 3,['E']= 4,['F']= 5,['G']= 6,['H']= 7,
+        ['I']= 8,['J']= 9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+        ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+        ['Y']=24,['Z']=25,['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,
+        ['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,
+        ['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,
+        ['w']=48,['x']=49,['y']=50,['z']=51,['0']=52,['1']=53,['2']=54,['3']=55,
+        ['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63,
+    };
+    int nbits = 0, out_len = 0;
+    uint32_t acc = 0;
+
+    for (int i = 0; i < in_len; i++) {
+        unsigned char c = (unsigned char) in[i];
+        if (c == '=') {
+            break;
+        }
+        /* T['A'] is 0 and so is every unmapped slot, so 'A' needs its own test */
+        if (T[c] == 0 && c != 'A') {
+            return -1;
+        }
+        acc = (acc << 6) | (uint32_t) T[c];
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (out_len >= out_max) {
+                return -1;
+            }
+            out[out_len++] = (unsigned char) ((acc >> nbits) & 0xff);
+        }
+    }
+    return out_len;
+}
+
+/** Point at the value of SDP attribute "a=<name>:", and give its length.
+    Returns NULL when absent. Only matches at the start of a line, so an
+    attribute name appearing inside another attribute's value cannot match. */
+static const char *
+sdp_attribute(const char *sdp, int sdp_len, const char *name, int *value_len)
+{
+    int name_len = (int) strlen(name);
+    for (int i = 0; i + 2 + name_len < sdp_len; i++) {
+        if (sdp[i] != 'a' || sdp[i + 1] != '=') {
+            continue;
+        }
+        if (i && sdp[i - 1] != '\n' && sdp[i - 1] != '\r') {
+            continue;
+        }
+        if (strncmp(sdp + i + 2, name, (size_t) name_len) != 0 ||
+            sdp[i + 2 + name_len] != ':') {
+            continue;
+        }
+        const char *val = sdp + i + 2 + name_len + 1;
+        const char *end = val;
+        const char *limit = sdp + sdp_len;
+        while (end < limit && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        *value_len = (int) (end - val);
+        return val;
+    }
+    return NULL;
+}
+
+static void
+raop_handler_announce(raop_conn_t *conn,
+                      http_request_t *request, http_response_t *response,
+                      char **response_data, int *response_datalen)
+{
+    raop_t *raop = conn->raop;
+
+    if (!pin_gate(conn, response, "ANNOUNCE")) {
+        return;
+    }
+
+    /* Disarm first. Every refusal below must leave the connection unable to
+       SETUP, or a sender could follow a rejected ANNOUNCE with a bodyless
+       SETUP and get a session built from whatever the last good ANNOUNCE
+       left behind. Everything is parsed into locals and committed in one
+       block at the end for the same reason. */
+    conn->classic_raop = false;
+
+    int sdp_len = 0;
+    const char *sdp = http_request_get_data(request, &sdp_len);
+    if (!sdp || sdp_len <= 0) {
+        logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE with no SDP body");
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
+
+    int val_len = 0;
+    const char *val = sdp_attribute(sdp, sdp_len, "fpaeskey", &val_len);
+    if (!val) {
+        /* shairport-sync also accepts a=rsaaeskey here, which is the AirPlay 1
+           path that needs Apple's leaked AirPort Express private RSA key. We
+           carry no RSA key, and no macOS sender observed on this bench asks
+           for one -- see docs/airplay.md. */
+        logger_log(raop->logger, LOGGER_ERR,
+                   "ANNOUNCE without a=fpaeskey; only the FairPlay key exchange is supported");
+        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+        return;
+    }
+
+    unsigned char ekey[72] = { 0 };
+    int ekey_len = raop_base64_decode(val, val_len, ekey, (int) sizeof(ekey));
+    if (ekey_len != (int) sizeof(ekey)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "ANNOUNCE a=fpaeskey decoded to %d bytes, expected %zu",
+                   ekey_len, sizeof(ekey));
+        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+        return;
+    }
+
+    /* fairplay_decrypt refuses unless fairplay_handshake has run on this
+       connection (it checks keymsglen == 164). macOS does both fp-setup
+       stages before ANNOUNCE, so this holds -- a client that skipped them
+       gets an error here rather than a garbage key. */
+    unsigned char aeskey[16] = { 0 };
+    if (fairplay_decrypt(conn->fairplay, ekey, aeskey) < 0) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "ANNOUNCE: fairplay_decrypt failed; fp-setup did not complete on this connection");
+        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+        return;
+    }
+
+    unsigned char aesiv[16] = { 0 };
+    val = sdp_attribute(sdp, sdp_len, "aesiv", &val_len);
+    int iv_len = val ? raop_base64_decode(val, val_len, aesiv, (int) sizeof(aesiv)) : -1;
+    if (iv_len != (int) sizeof(aesiv)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "ANNOUNCE a=aesiv decoded to %d bytes, expected %zu", iv_len, sizeof(aesiv));
+        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+        return;
+    }
+
+    /* a=rtpmap:96 AppleLossless -- the only codec this path offers. The
+       uncompressed "L16/44100/2" form shairport also accepts is not wired to
+       our renderers, so refuse it rather than render noise. */
+    char rtpmap[64] = { 0 };
+    val = sdp_attribute(sdp, sdp_len, "rtpmap", &val_len);
+    if (val && val_len > 0) {
+        /* the SDP body is not NUL-terminated, so copy before any str* call */
+        int n = val_len < (int) sizeof(rtpmap) - 1 ? val_len : (int) sizeof(rtpmap) - 1;
+        memcpy(rtpmap, val, (size_t) n);
+    }
+    if (!strstr(rtpmap, "AppleLossless")) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "ANNOUNCE a=rtpmap is not AppleLossless: \"%s\"", rtpmap);
+        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        return;
+    }
+
+    /* a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
+       Twelve ALAC parameters. We act on frames-per-packet (index 1) and the
+       sample rate (index 11). alac_reset() in the JNI hardcodes the other
+       ten AND the rate, so a sender that differs would decode as noise with
+       no other symptom -- hence the refusal below rather than a warning. */
+    unsigned short spf = 352;
+    unsigned int sr = AUDIO_SAMPLE_RATE;
+    val = sdp_attribute(sdp, sdp_len, "fmtp", &val_len);
+    if (val && val_len > 0) {
+        char fmtp[160] = { 0 };
+        int n = val_len < (int) sizeof(fmtp) - 1 ? val_len : (int) sizeof(fmtp) - 1;
+        memcpy(fmtp, val, (size_t) n);
+        logger_log(raop->logger, LOGGER_INFO, "ANNOUNCE fmtp: %s", fmtp);
+
+        long f[12];
+        int nf = 0;
+        char *save = NULL;
+        for (char *tok = strtok_r(fmtp, " \t", &save); tok && nf < 12;
+             tok = strtok_r(NULL, " \t", &save)) {
+            f[nf++] = strtol(tok, NULL, 10);
+        }
+        /* range-checked in the long domain, before any narrowing cast */
+        if (nf >= 2 && f[1] >= 64 && f[1] <= 4096) {   /* 4096 == ALAC_MAX_SPF in uxplay_jni.c */
+            spf = (unsigned short) f[1];
+        }
+        if (nf >= 12) {
+            /* The decoder is fixed at 44100 (alac_reset sets setinfo_8a_rate)
+               and nothing carries a rate down to it, so any other value would
+               play at the wrong speed while the RTP clock ran at the announced
+               one. Refuse instead. It also keeps a hostile or absurd value out
+               of raop_rtp_start_audio, where SECOND_IN_NSECS / sr is integer
+               division: anything above 1e9, and anything that wraps to 0 in
+               the cast, divides by or yields zero. */
+            if (f[11] != AUDIO_SAMPLE_RATE) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "ANNOUNCE fmtp sample rate is %ld; only %d is supported",
+                           f[11], AUDIO_SAMPLE_RATE);
+                http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+                return;
+            }
+            sr = (unsigned int) f[11];
+            if (f[3] != 16 || f[4] != 40 || f[5] != 10 || f[6] != 14 ||
+                f[7] != 2 || f[8] != 255) {
+                logger_log(raop->logger, LOGGER_WARNING,
+                           "ANNOUNCE fmtp is not the canonical ALAC line; alac_reset() hardcodes"
+                           " all but frames-per-packet, so audio may decode as noise");
+            }
+        }
+    }
+
+    /* Commit, with the arming flag last. */
+    memcpy(conn->classic_aeskey, aeskey, sizeof(conn->classic_aeskey));
+    memcpy(conn->classic_aesiv, aesiv, sizeof(conn->classic_aesiv));
+    conn->classic_spf = spf;
+    conn->classic_sr = sr;
+    conn->classic_ct = 2;
+    conn->classic_raop = true;
+
+    logger_log(raop->logger, LOGGER_INFO,
+               "classic RAOP session announced: ALAC, %u frames/packet, %u Hz",
+               conn->classic_spf, conn->classic_sr);
+}
+
+/** Read "name=<number>" out of an RTSP Transport header. Returns 0 when the
+    parameter is absent or malformed; the caller decides what that means.
+    control_port is required, timing_port is not -- without it the NTP thread
+    cannot reach the sender and logs every few seconds, but audio still plays,
+    because initial_sync comes from the control-port SYNC packet and the
+    renderer falls back to local time. That matches what the AirPlay 2 path
+    does with a missing timingPort, deliberately. */
+static unsigned short
+transport_port(const char *transport, const char *name)
+{
+    const char *p = transport;
+    size_t name_len = strlen(name);
+
+    while ((p = strstr(p, name)) != NULL) {
+        /* must be a whole parameter, not the tail of another: control_port
+           ends in "_port" and would otherwise match a search for "port" */
+        if (p != transport && p[-1] != ';' && p[-1] != ' ') {
+            p += name_len;
+            continue;
+        }
+        if (p[name_len] != '=') {
+            p += name_len;
+            continue;
+        }
+        long v = strtol(p + name_len + 1, NULL, 10);
+        return (v > 0 && v <= 65535) ? (unsigned short) v : 0;
+    }
+    return 0;
+}
+
+/** The classic RAOP SETUP: everything it needs arrived in ANNOUNCE except the
+    sender's two port numbers, which are in the Transport header. */
+static void
+raop_handler_setup_classic(raop_conn_t *conn, const char *transport,
+                           http_response_t *response)
+{
+    raop_t *raop = conn->raop;
+
+    if (!conn->classic_raop) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "classic SETUP without a preceding ANNOUNCE on this connection");
+        http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
+        return;
+    }
+
+    unsigned short control_rport = transport_port(transport, "control_port");
+    unsigned short timing_rport = transport_port(transport, "timing_port");
+    if (!control_rport) {
+        logger_log(raop->logger, LOGGER_ERR, "classic SETUP Transport has no usable control_port: %s",
+                   transport);
+        http_response_init(response, "RTSP/1.0", 461, "Unsupported Transport");
+        return;
+    }
+
+    /* A second SETUP on the same connection would otherwise leak the first
+       session's threads and sockets. The AirPlay 2 path above NULLs these
+       without destroying them; do not copy that here.
+
+       Order matters, and it is the order conn_destroy uses: rtp, then mirror,
+       then ntp. Both raop_rtp and raop_rtp_mirror cache the raop_ntp pointer
+       (raop_rtp.c:152, raop_rtp_mirror.c:149) and neither clears it on stop,
+       so destroying ntp first would leave the mirror thread writing into
+       freed memory -- raop_ntp_set_video_arrival_offset is a bare unguarded
+       store of a value taken straight off the wire. The mirror is created
+       unconditionally by the AirPlay 2 ekey/eiv block, for audio-only
+       sessions too, so it can be live here even though classic RAOP has no
+       video of its own. */
+    if (conn->raop_rtp) {
+        raop_rtp_stop(conn->raop_rtp);
+        raop_rtp_destroy(conn->raop_rtp);
+        conn->raop_rtp = NULL;
+    }
+    if (conn->raop_rtp_mirror) {
+        raop_rtp_mirror_stop(conn->raop_rtp_mirror);
+        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+        conn->raop_rtp_mirror = NULL;
+    }
+    if (conn->raop_ntp) {
+        /* raop_ntp_destroy stops it itself (raop_ntp.c:201) */
+        raop_ntp_destroy(conn->raop_ntp);
+        conn->raop_ntp = NULL;
+    }
+
+    char remote[40] = { 0 };
+    int len = utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
+                                        remote, (int) sizeof(remote));
+    if (!len || len > (int) sizeof(remote)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "classic SETUP: could not render the client address; cannot reply to it");
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+
+    /* Classic RAOP is the "old protocol without offset" that raop_ntp names
+       TP_UNSPECIFIED -- it predates AirPlay 2's timingProtocol negotiation. */
+    timing_protocol_t time_protocol = TP_UNSPECIFIED;
+    unsigned short timing_lport = raop->timing_lport;
+
+    conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote, conn->remotelen,
+                                   timing_rport, &time_protocol);
+    if (!conn->raop_ntp) {
+        logger_log(raop->logger, LOGGER_ERR, "classic SETUP: raop_ntp_init failed");
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+    raop_ntp_start(conn->raop_ntp, &timing_lport);
+    conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
+                                   remote, conn->remotelen,
+                                   conn->classic_aeskey, conn->classic_aesiv);
+    if (!conn->raop_rtp) {
+        logger_log(raop->logger, LOGGER_ERR, "classic SETUP: raop_rtp_init failed");
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+
+    /* Tell the renderers what is coming. This is what resets the ALAC decoder
+       to the announced frames-per-packet; without it a non-default spf decodes
+       as noise. usingScreen/isMedia are false: classic RAOP has no video. */
+    unsigned char ct = conn->classic_ct;
+    unsigned short spf = conn->classic_spf;
+    bool using_screen = false, is_media = false;
+    uint64_t audio_format = 0;
+    if (raop->callbacks.audio_get_format) {
+        raop->callbacks.audio_get_format(raop->callbacks.cls, &ct, &spf, &using_screen,
+                                         &is_media, &audio_format);
+    }
+
+    /* Seed from config, as the AirPlay 2 audio case does: uxplay's -p exists
+       to pin exactly these ports for a firewall, and 6000/6001/7011 are the
+       classic-RAOP numbers. On porg all three are 0, meaning "any". */
+    unsigned short control_lport = raop->control_lport, data_lport = raop->data_lport;
+    unsigned int sr = conn->classic_sr;
+    raop_rtp_start_audio(conn->raop_rtp, &control_rport, &control_lport, &data_lport, &ct, &sr);
+
+    /* raop_rtp_start_audio returns void and simply does not write back the
+       out-params if the sockets fail, which would leave us answering 200 with
+       server_port=0 and the sender streaming into nowhere with nothing to
+       diagnose. Treat a zero port as the failure it is. */
+    if (!control_lport || !data_lport) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "classic SETUP: audio sockets failed to bind (control=%u data=%u)",
+                   control_lport, data_lport);
+        raop_rtp_stop(conn->raop_rtp);
+        raop_rtp_destroy(conn->raop_rtp);
+        conn->raop_rtp = NULL;
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+
+    char reply[256];
+    snprintf(reply, sizeof(reply),
+             "RTP/AVP/UDP;unicast;mode=record;server_port=%u;control_port=%u;timing_port=%u",
+             data_lport, control_lport, timing_lport);
+    http_response_add_header(response, "Transport", reply);
+    http_response_add_header(response, "Session", "1");
+    /* No Audio-Jack-Status here: conn_request already added
+       "connected; type=digital" to every CSeq-bearing non-RECORD response
+       (raop.c:374-376), and add_header only appends -- a second one would
+       leave two contradictory values on the wire. digital is also the
+       truthful value for an HDMI sink. */
+
+    logger_log(raop->logger, LOGGER_INFO,
+               "classic RAOP audio: server_port=%u control_port=%u timing_port=%u"
+               " (client control_port=%u timing_port=%u)",
+               data_lport, control_lport, timing_lport, control_rport, timing_rport);
 }
 
 static void
@@ -813,6 +1226,16 @@ raop_handler_setup(raop_conn_t *conn,
         if (conn->raop_rtp) {
             raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote_header);
         }
+    }
+
+    /* Classic RAOP SETUP: no body at all, parameters in a Transport: header.
+       This must branch BEFORE plist_from_bin below -- falling through does not
+       crash, it answers 200 with an empty dict and no Transport header, and a
+       silent success is worse for the sender than an honest refusal. */
+    const char *transport = http_request_get_header(request, "Transport");
+    if (transport) {
+        raop_handler_setup_classic(conn, transport, response);
+        return;
     }
 
     // Parsing bplist
@@ -1497,6 +1920,9 @@ raop_handler_teardown(raop_conn_t *conn,
 {
     /* get the teardown request type(s):  (type 96, 110, or none) */
     raop_t *raop = conn->raop;
+    /* Disarm the classic path. Without this a TEARDOWN followed by a bodyless
+       SETUP would rebuild a session from the previous ANNOUNCE's key and iv. */
+    conn->classic_raop = false;
     const char *data = NULL;
     int data_len = 0;
     bool teardown_96 = false, teardown_110 = false;

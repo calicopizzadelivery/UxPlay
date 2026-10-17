@@ -142,6 +142,18 @@ struct raop_conn_s {
        raop_t.pin_generation. 0 means it never completed step 1. */
     unsigned int pin_generation;
 
+    /* Classic AirPlay 1 / RAOP. The session key and the stream parameters
+       arrive in ANNOUNCE's SDP, one request before SETUP, where AirPlay 2
+       carries them in SETUP's own plist. macOS drives every audio-only
+       session this way -- Apple Music and Sound > Output alike -- so these
+       hold what ANNOUNCE decoded until SETUP builds the session from them. */
+    bool classic_raop;
+    unsigned char classic_aeskey[16];
+    unsigned char classic_aesiv[16];
+    unsigned short classic_spf;
+    unsigned int classic_sr;
+    unsigned char classic_ct;
+
     /* In pin mode: this client proved the pin on this connection, or
        pair-verify found its key among the registered ones. */
     bool pin_verified;
@@ -450,6 +462,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             }
         } else if (!strcmp(method, "OPTIONS")) {
             handler = &raop_handler_options;
+        } else if (!strcmp(method, "ANNOUNCE")) {
+            handler = &raop_handler_announce;
         } else if (!strcmp(method, "SETUP")) {
             raop->hls_pending = false;
             handler = &raop_handler_setup;
@@ -506,56 +520,6 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     } else {
         logger_log(raop->logger, LOGGER_INFO,
                    "Unhandled Client Request: %s %s %s", method, url, protocol);
-        /* Classic-RAOP probe. macOS drives audio-only over AirPlay 1, whose
-           ANNOUNCE carries the session key in the SDP, and which key attribute
-           it uses decides whether this is implementable at all:
-
-             a=fpaeskey:   FairPlay-wrapped. fairplay_decrypt() already exists
-                           and wants exactly 72 bytes, so no new crypto.
-             a=rsaaeskey:  encrypted to Apple's AirPort Express public key. We
-                           carry no RSA private key; shairport-sync does.
-             neither:      unencrypted, which shairport also accepts.
-
-           So log the attribute NAMES and their decoded byte counts, and never
-           the values: these are session keys. That is also why this cannot be
-           done by raising the log level -- DEBUG prints SRP proofs, the AES iv
-           and the fairplay-decrypted audio key, which is why uxplay_jni.c pins
-           LOGGER_INFO. Remove this once the question is settled. */
-        const char *ctype = http_request_get_header(request, "Content-Type");
-        if (ctype && strstr(ctype, "application/sdp")) {
-            int sdplen = 0;
-            const char *sdp = http_request_get_data(request, &sdplen);
-            const char *chal = http_request_get_header(request, "Apple-Challenge");
-            logger_log(raop->logger, LOGGER_INFO,
-                       "SDP probe: %d bytes, Apple-Challenge %s",
-                       sdplen, chal ? "present" : "absent");
-            for (int i = 0; sdp && i < sdplen; i++) {
-                if (sdp[i] != 'a' || i + 1 >= sdplen || sdp[i + 1] != '=') {
-                    continue;
-                }
-                if (i && sdp[i - 1] != '\n' && sdp[i - 1] != '\r') {
-                    continue;   /* only at the start of a line */
-                }
-                int j = i + 2;
-                while (j < sdplen && sdp[j] != ':' && sdp[j] != '\r' && sdp[j] != '\n') {
-                    j++;
-                }
-                int namelen = j - (i + 2);
-                int vallen = 0;
-                if (j < sdplen && sdp[j] == ':') {
-                    int k = j + 1;
-                    while (k < sdplen && sdp[k] != '\r' && sdp[k] != '\n') {
-                        k++;
-                    }
-                    vallen = k - (j + 1);
-                }
-                /* base64 without padding, as SDP carries it */
-                logger_log(raop->logger, LOGGER_INFO,
-                           "  a=%.*s  (%d base64 chars, ~%d bytes)",
-                           namelen, sdp + i + 2, vallen, (vallen * 3) / 4);
-                i = j;
-            }
-        }
     }
 
     finish:;
