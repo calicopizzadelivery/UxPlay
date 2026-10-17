@@ -299,6 +299,12 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "cn", strlen(RAOP_CN), RAOP_CN);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "da", strlen(RAOP_DA), RAOP_DA);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "et", strlen(RAOP_ET), RAOP_ET);
+    /* "encryption key available" -- the legacy flag that says the RSA key
+       exchange (et=1) can actually be completed. shairport-sync sets it in
+       its classic branch (bonjour_strings.c:138) and is the only receiver
+       macOS is known to drive over RSA; we never set it, which may be why a
+       Mac reaches for FairPlay regardless of what "et" offers. */
+    dnssd->TXTRecordSetValue(&dnssd->raop_record, "ek", strlen("1"), "1");
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "vv", strlen(RAOP_VV), RAOP_VV);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "ft", strlen(features), features);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "am", strlen(GLOBAL_MODEL), GLOBAL_MODEL);

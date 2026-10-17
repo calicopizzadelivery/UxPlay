@@ -68,6 +68,17 @@ void x25519_key_get_raw(unsigned char data[X25519_KEY_SIZE], const x25519_key_t 
 void x25519_key_destroy(x25519_key_t *key);
 int get_random_bytes(unsigned char *buf, int num);
 void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len);
+
+/** Unwrap a classic-RAOP "a=rsaaeskey" with the AirPort Express private key.
+    Returns the plaintext length, -1 on failure, or -2 when the build carries
+    no key. See lib/rsakey.c for what that key is and why it is here. */
+int rsa_aeskey_decrypt(const unsigned char *input, int inlen,
+                       unsigned char *output, int outlen);
+
+/** RSA-sign a classic-RAOP Apple-Challenge payload with the same key.
+    Returns the signature length, -1 on failure, -2 with no key. */
+int rsa_auth_sign(const unsigned char *input, int inlen,
+                  unsigned char *output, int outlen);
   
 void x25519_derive_secret(unsigned char secret[X25519_KEY_SIZE], const x25519_key_t *ours, const x25519_key_t *theirs);
 

@@ -153,6 +153,7 @@ struct raop_conn_s {
     unsigned short classic_spf;
     unsigned int classic_sr;
     unsigned char classic_ct;
+    bool classic_encrypted;
 
     /* In pin mode: this client proved the pin on this connection, or
        pair-verify found its key among the registered ones. */
@@ -528,6 +529,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         if (cseq) {
             http_response_add_header(*response, "CSeq", cseq);
         }
+        /* Classic RAOP challenge-response. A legacy sender puts an
+           Apple-Challenge on its requests and expects an Apple-Response
+           signed with the AirPort Express private key; without one a Mac
+           closes the connection straight after OPTIONS and reports the
+           receiver as incompatible. shairport-sync answers it on every RTSP
+           request (rtsp.c:4209), so do the same rather than only on OPTIONS. */
+        raop_apple_challenge(conn, request, *response);
     }
     http_response_finish(*response, response_data, response_datalen);
     int len = 0;

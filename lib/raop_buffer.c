@@ -69,15 +69,15 @@ raop_buffer_init(logger_t *logger,
                  const unsigned char *aeskey,
                  const unsigned char *aesiv)
 {
-    assert(aeskey);
-    assert(aesiv);
+    /* aeskey/aesiv may be NULL: a classic RAOP sender that negotiated
+       encryption type 0 sends the ALAC frames in clear. */
     raop_buffer_t *raop_buffer = (raop_buffer_t *) calloc(1, sizeof(raop_buffer_t));
     if (!raop_buffer) {
         return NULL;
     }
     raop_buffer->logger = logger;
     // Need to be initialized internally
-    raop_buffer->aes_ctx = aes_cbc_init(aeskey, aesiv, AES_DECRYPT);
+    raop_buffer->aes_ctx = (aeskey && aesiv) ? aes_cbc_init(aeskey, aesiv, AES_DECRYPT) : NULL;
 
     for (int i = 0; i < RAOP_BUFFER_LENGTH; i++) {
         raop_buffer_entry_t *entry = &raop_buffer->entries[i];
@@ -130,10 +130,14 @@ raop_buffer_decrypt(raop_buffer_t *raop_buffer, unsigned char *data, unsigned ch
     int encryptedlen = payload_size / 16*16;
     memset(output, 0, payload_size);
 
-    aes_cbc_decrypt(raop_buffer->aes_ctx, &data[12], output, encryptedlen);
-    aes_cbc_reset(raop_buffer->aes_ctx);
-
-    memcpy(output + encryptedlen, &data[12 + encryptedlen], payload_size - encryptedlen);
+    if (raop_buffer->aes_ctx) {
+        aes_cbc_decrypt(raop_buffer->aes_ctx, &data[12], output, encryptedlen);
+        aes_cbc_reset(raop_buffer->aes_ctx);
+        memcpy(output + encryptedlen, &data[12 + encryptedlen], payload_size - encryptedlen);
+    } else {
+        /* encryption type 0: the payload is already in clear */
+        memcpy(output, &data[12], payload_size);
+    }
     *outputlen = payload_size;
     if (payload_size &&  DECRYPTION_TEST){
         switch (output[0]) {

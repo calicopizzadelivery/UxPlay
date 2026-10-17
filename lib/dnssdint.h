@@ -27,7 +27,22 @@
 #define RAOP_TXTVERS "1"
 #define RAOP_CH "2"             /* Audio channels: 2 */
 #define RAOP_CN "0,1,2,3"       /* Audio codec: PCM, ALAC, AAC, AAC ELD */
-#define RAOP_ET "0,3,5"         /* Encryption type: None, FairPlay, FairPlay SAPv2.5 */
+/* Encryption type: None, FairPlay SAPv2.5. "3" (plain FairPlay) is NOT
+   advertised: lib/playfair implements exactly one key derivation
+   (playfair.c:13), and it is only correct for the version-0x03 key message.
+   A macOS sender offered "3" picks it, sends FPLY version 0x02, and
+   fairplay_decrypt then returns 16 bytes that are not the session key -- the
+   audio decrypts to random bytes, ALAC parses them as a uniformly random
+   3-bit channel tag, and the result is ~40%% duty-cycle bursts of noise with
+   a 2:1 left/right ratio. Measured off HDMI 2026-10-17; see docs/airplay.md.
+
+   "5" is gone too, for now: macOS sends a version-0x02 key message whatever
+   we advertise, so neither FairPlay variant yields a usable key. "1" is RSA,
+   which is what shairport-sync offers (bonjour_strings.c:87) and unwraps with
+   Apple's leaked AirPort Express private key -- we carry no such key. So this
+   offers encryption type 0 alone, to establish whether macOS will stream
+   unencrypted on a LAN. If it will, no key of any kind is needed. */
+#define RAOP_ET "0,1"
 #define RAOP_VV "2"
 #define FEATURES_1 "0x5A7FFEE6" /* first 32 bits of features, with bit 27 ("supports legacy pairing") ON */
 //#define FEATURES_1 "0x527FFEE6" /* first 32 bits of features, with bit 27 ("supports legacy pairing") OFF */

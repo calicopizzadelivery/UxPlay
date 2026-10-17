@@ -20,6 +20,7 @@
 
 #include "dnssdint.h"
 #include "utils.h"
+#include "crypto.h"   /* rsa_aeskey_decrypt, for classic RAOP */
 #include <ctype.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -907,49 +908,93 @@ raop_handler_announce(raop_conn_t *conn,
         return;
     }
 
+    /* Three shapes are possible, and which one arrives is decided by the "et"
+       record we advertise (dnssdint.h) and by what the sender supports:
+         a=rsaaeskey  encrypted to the AirPort Express public key -- RSA, et=1
+         a=fpaeskey   FairPlay-wrapped -- et=3 or 5
+         neither      encryption type 0, the stream is in clear -- et=0
+       macOS only ever offers the first two, and its FairPlay key message is
+       version 0x02, which lib/playfair cannot unwrap. So RSA is the path that
+       works; see lib/rsakey.c. */
     int val_len = 0;
-    const char *val = sdp_attribute(sdp, sdp_len, "fpaeskey", &val_len);
+    bool encrypted = true;
+    bool rsa = false;
+    const char *val = sdp_attribute(sdp, sdp_len, "rsaaeskey", &val_len);
+    if (val) {
+        rsa = true;
+    } else {
+        val = sdp_attribute(sdp, sdp_len, "fpaeskey", &val_len);
+    }
     if (!val) {
-        /* shairport-sync also accepts a=rsaaeskey here, which is the AirPlay 1
-           path that needs Apple's leaked AirPort Express private RSA key. We
-           carry no RSA key, and no macOS sender observed on this bench asks
-           for one -- see docs/airplay.md. */
-        logger_log(raop->logger, LOGGER_ERR,
-                   "ANNOUNCE without a=fpaeskey; only the FairPlay key exchange is supported");
-        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
-        return;
+        int iv_probe = 0;
+        if (sdp_attribute(sdp, sdp_len, "aesiv", &iv_probe)) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "ANNOUNCE has a=aesiv but no key attribute");
+            http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+            return;
+        }
+        /* No key and no iv: encryption type 0. shairport has the same branch
+           (rtsp.c:3563-3565). macOS has never taken it on this bench. */
+        logger_log(raop->logger, LOGGER_INFO, "ANNOUNCE: unencrypted session");
+        encrypted = false;
     }
 
-    unsigned char ekey[72] = { 0 };
-    int ekey_len = raop_base64_decode(val, val_len, ekey, (int) sizeof(ekey));
-    if (ekey_len != (int) sizeof(ekey)) {
-        logger_log(raop->logger, LOGGER_ERR,
-                   "ANNOUNCE a=fpaeskey decoded to %d bytes, expected %zu",
-                   ekey_len, sizeof(ekey));
-        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
-        return;
-    }
-
-    /* fairplay_decrypt refuses unless fairplay_handshake has run on this
-       connection (it checks keymsglen == 164). macOS does both fp-setup
-       stages before ANNOUNCE, so this holds -- a client that skipped them
-       gets an error here rather than a garbage key. */
     unsigned char aeskey[16] = { 0 };
-    if (fairplay_decrypt(conn->fairplay, ekey, aeskey) < 0) {
-        logger_log(raop->logger, LOGGER_ERR,
-                   "ANNOUNCE: fairplay_decrypt failed; fp-setup did not complete on this connection");
-        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
-        return;
-    }
-
     unsigned char aesiv[16] = { 0 };
-    val = sdp_attribute(sdp, sdp_len, "aesiv", &val_len);
-    int iv_len = val ? raop_base64_decode(val, val_len, aesiv, (int) sizeof(aesiv)) : -1;
-    if (iv_len != (int) sizeof(aesiv)) {
-        logger_log(raop->logger, LOGGER_ERR,
-                   "ANNOUNCE a=aesiv decoded to %d bytes, expected %zu", iv_len, sizeof(aesiv));
-        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
-        return;
+
+    if (encrypted) {
+        /* RSA ciphertext is one modulus block (256 bytes for RSA-2048);
+           FairPlay's is a fixed 72. */
+        unsigned char ekey[512] = { 0 };
+        int ekey_len = raop_base64_decode(val, val_len, ekey, (int) sizeof(ekey));
+        if (ekey_len <= 0) {
+            logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: undecodable key attribute");
+            http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+            return;
+        }
+
+        if (rsa) {
+            int n = rsa_aeskey_decrypt(ekey, ekey_len, aeskey, (int) sizeof(aeskey));
+            if (n == -2) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "ANNOUNCE: a=rsaaeskey needs the AirPort Express private key,"
+                           " which this build does not carry -- see lib/rsakey.c");
+                http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+                return;
+            }
+            if (n != (int) sizeof(aeskey)) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "ANNOUNCE a=rsaaeskey unwrapped to %d bytes, expected %zu",
+                           n, sizeof(aeskey));
+                http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+                return;
+            }
+        } else {
+            /* fairplay_decrypt refuses unless fairplay_handshake ran on this
+               connection (keymsglen == 164) AND the key message was version
+               0x03. macOS sends 0x02, which playfair cannot unwrap. */
+            if (ekey_len != 72) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "ANNOUNCE a=fpaeskey decoded to %d bytes, expected 72", ekey_len);
+                http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+                return;
+            }
+            if (fairplay_decrypt(conn->fairplay, ekey, aeskey) < 0) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "ANNOUNCE: could not unwrap the session key");
+                http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+                return;
+            }
+        }
+
+        val = sdp_attribute(sdp, sdp_len, "aesiv", &val_len);
+        int iv_len = val ? raop_base64_decode(val, val_len, aesiv, (int) sizeof(aesiv)) : -1;
+        if (iv_len != (int) sizeof(aesiv)) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "ANNOUNCE a=aesiv decoded to %d bytes, expected %zu", iv_len, sizeof(aesiv));
+            http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+            return;
+        }
     }
 
     /* a=rtpmap:96 AppleLossless -- the only codec this path offers. The
@@ -1025,11 +1070,90 @@ raop_handler_announce(raop_conn_t *conn,
     conn->classic_spf = spf;
     conn->classic_sr = sr;
     conn->classic_ct = 2;
+    conn->classic_encrypted = encrypted;
     conn->classic_raop = true;
 
     logger_log(raop->logger, LOGGER_INFO,
                "classic RAOP session announced: ALAC, %u frames/packet, %u Hz",
                conn->classic_spf, conn->classic_sr);
+}
+
+/** Answer a classic-RAOP "Apple-Challenge" with "Apple-Response".
+
+    The payload signed is challenge || local IP || MAC, zero-padded to at
+    least 32 bytes, RSA-signed with PKCS#1 v1.5 using the AirPort Express
+    private key, base64 with the padding stripped. This is shairport-sync's
+    apple_challenge() (rtsp.c:3725) reimplemented on our own primitives.
+
+    A sender that gets no Apple-Response hangs up after OPTIONS, which is what
+    macOS did when we first advertised as a legacy AirPlay 1 device. */
+static void
+raop_apple_challenge(raop_conn_t *conn, http_request_t *request, http_response_t *response)
+{
+    raop_t *raop = conn->raop;
+    const char *hdr = http_request_get_header(request, "Apple-Challenge");
+    if (!hdr) {
+        return;
+    }
+
+    unsigned char challenge[16] = { 0 };
+    int chall_len = raop_base64_decode(hdr, (int) strlen(hdr), challenge, (int) sizeof(challenge));
+    if (chall_len <= 0) {
+        logger_log(raop->logger, LOGGER_ERR, "Apple-Challenge did not decode");
+        return;
+    }
+
+    unsigned char buf[64] = { 0 };
+    int n = 0;
+    memcpy(buf + n, challenge, (size_t) chall_len);
+    n += chall_len;
+
+    /* the address the client reached us on, 4 bytes for IPv4 or 16 for IPv6 */
+    if (conn->locallen == 4 || conn->locallen == 16) {
+        memcpy(buf + n, conn->local, (size_t) conn->locallen);
+        n += conn->locallen;
+    } else {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Apple-Challenge: unexpected local address length %d", conn->locallen);
+        return;
+    }
+
+    int hw_len = 0;
+    const char *hw_addr = raop->dnssd ? dnssd_get_hw_addr(raop->dnssd, &hw_len) : NULL;
+    if (!hw_addr || hw_len != 6) {
+        logger_log(raop->logger, LOGGER_ERR, "Apple-Challenge: no usable hardware address");
+        return;
+    }
+    memcpy(buf + n, hw_addr, 6);
+    n += 6;
+
+    /* zero-padded to 32; the trailing bytes are already zero */
+    if (n < 32) {
+        n = 32;
+    }
+
+    unsigned char sig[512];
+    int sig_len = rsa_auth_sign(buf, n, sig, (int) sizeof(sig));
+    if (sig_len == -2) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Apple-Challenge: this build carries no AirPort Express key,"
+                   " so a legacy sender will refuse us -- see lib/rsakey.c");
+        return;
+    }
+    if (sig_len <= 0) {
+        logger_log(raop->logger, LOGGER_ERR, "Apple-Challenge: signing failed");
+        return;
+    }
+
+    /* base64, then drop the '=' padding as senders expect */
+    char encoded[768] = { 0 };
+    pk_to_base64(sig, sig_len, encoded, (int) sizeof(encoded));
+    char *pad = strchr(encoded, '=');
+    if (pad) {
+        *pad = '\0';
+    }
+    http_response_add_header(response, "Apple-Response", encoded);
+    logger_log(raop->logger, LOGGER_INFO, "answered Apple-Challenge (%d-byte signature)", sig_len);
 }
 
 /** Read "name=<number>" out of an RTSP Transport header. Returns 0 when the
@@ -1066,6 +1190,7 @@ transport_port(const char *transport, const char *name)
     sender's two port numbers, which are in the Transport header. */
 static void
 raop_handler_setup_classic(raop_conn_t *conn, const char *transport,
+                           const char *dacp_id, const char *active_remote_header,
                            http_response_t *response)
 {
     raop_t *raop = conn->raop;
@@ -1140,7 +1265,8 @@ raop_handler_setup_classic(raop_conn_t *conn, const char *transport,
     raop_ntp_start(conn->raop_ntp, &timing_lport);
     conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
                                    remote, conn->remotelen,
-                                   conn->classic_aeskey, conn->classic_aesiv);
+                                   conn->classic_encrypted ? conn->classic_aeskey : NULL,
+                                   conn->classic_encrypted ? conn->classic_aesiv : NULL);
     if (!conn->raop_rtp) {
         logger_log(raop->logger, LOGGER_ERR, "classic SETUP: raop_rtp_init failed");
         http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
@@ -1193,6 +1319,15 @@ raop_handler_setup_classic(raop_conn_t *conn, const char *transport,
        leave two contradictory values on the wire. digital is also the
        truthful value for an HDMI sink. */
 
+    /* Re-register DACP. raop_handler_setup does this before the Transport
+       branch, against a conn->raop_rtp that is NULL on a first classic SETUP
+       and is destroyed and recreated above on a second one, so without this
+       a classic session never gets remote control. The AirPlay 2 path is
+       unaffected: its raop_rtp already exists by then. */
+    if (dacp_id && active_remote_header) {
+        raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote_header);
+    }
+
     logger_log(raop->logger, LOGGER_INFO,
                "classic RAOP audio: server_port=%u control_port=%u timing_port=%u"
                " (client control_port=%u timing_port=%u)",
@@ -1234,7 +1369,7 @@ raop_handler_setup(raop_conn_t *conn,
        silent success is worse for the sender than an honest refusal. */
     const char *transport = http_request_get_header(request, "Transport");
     if (transport) {
-        raop_handler_setup_classic(conn, transport, response);
+        raop_handler_setup_classic(conn, transport, dacp_id, active_remote_header, response);
         return;
     }
 

@@ -31,6 +31,7 @@ struct fairplay_s {
 
     unsigned char keymsg[164];
     unsigned int keymsglen;
+    unsigned char version;      /* FPLY version byte of the key message */
 };
 
 fairplay_t *
@@ -93,6 +94,7 @@ fairplay_handshake(fairplay_t *fp, const unsigned char req[164], unsigned char r
 
     memcpy(fp->keymsg, req, 164);
     fp->keymsglen = 164;
+    fp->version = req[4];
 
     memcpy(res, fp_header, 12);
     memcpy(res + 12, req + 144, 20);
@@ -103,6 +105,18 @@ int
 fairplay_decrypt(fairplay_t *fp, const unsigned char input[72], unsigned char output[16])
 {
     if (fp->keymsglen != 164) {
+        return -1;
+    }
+    if (fp->version != 0x03) {
+        /* Answering fp-setup with the 0x03 reply blobs whatever the version is
+           safe, and shairport-sync does the same (rtsp.c:1920): nothing is
+           computed from the version there, the replies are fixed tables. The
+           key unwrap is a different matter. playfair_decrypt is one fixed
+           derivation and silently returns 16 wrong bytes for any other
+           version, which plays as noise instead of failing. Refuse. */
+        logger_log(fp->logger, LOGGER_ERR,
+                   "fairplay: cannot derive an audio key from a type 0x%02x key message",
+                   fp->version);
         return -1;
     }
 

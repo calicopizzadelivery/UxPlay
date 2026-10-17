@@ -1023,6 +1023,16 @@ void alac_decode_frame(alac_file *alac, unsigned char *inbuffer, void *outbuffer
 
     break;
   }
+
+  default:
+    /* 2..7 are channel configurations this decoder does not implement. Without
+       this arm the switch body is skipped while *outputsize is already set to
+       outputsamples * bytespersample above, and the caller ships an unwritten
+       output buffer -- uninitialised stack -- to the audio sink. The tag is 3
+       bits straight off the wire, so any sender can reach it, and a stream
+       decrypted with the wrong key reaches it on 6 packets in 8. */
+    *outputsize = 0;
+    return;
   }
 }
 

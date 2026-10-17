@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/system_properties.h>
 #include <time.h>
 
 #include "alac.h"
@@ -116,6 +117,17 @@ static int g_open_connections;
 /* The sender's clock mapped onto ours, fixed by the first frame of a
    connection, exactly as uxplay.cpp does. Then shifted from REALTIME to
    MONOTONIC for Java. */
+/** Read a boolean system property. The Java side reads most of our settings,
+    but this one is consulted below JNI while the mDNS records are built. */
+static bool prop_bool(const char *name, bool dflt) {
+    char buf[PROP_VALUE_MAX] = { 0 };
+    if (__system_property_get(name, buf) <= 0) {
+        return dflt;
+    }
+    return buf[0] == '1' || buf[0] == 't' || buf[0] == 'y' ||
+           strcmp(buf, "on") == 0;
+}
+
 static int64_t presentation_time_ns(uint64_t ntp_local, uint64_t ntp_remote) {
     pthread_mutex_lock(&g_clock_lock);
     if (g_remote_clock_offset == 0) {
@@ -419,6 +431,9 @@ static void cb_audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *da
         /* Exactly one frame's worth, so the decoder's own check refuses a
            frame that claims more samples than the stream was set up for. */
         int out_bytes = g_alac_spf * 4;
+        /* alac_decode_frame can return without writing pcm; never hand the
+           sink uninitialised stack. */
+        memset(pcm, 0, (size_t) out_bytes);
         alac_decode_frame(g_alac, g_alac_in, pcm, &out_bytes);
         pthread_mutex_unlock(&g_alac_lock);
         if (out_bytes <= 0)
@@ -693,8 +708,27 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
 
     if (dnssd_register_raop(g_dnssd, port) != 0)
         ALOGW("could not advertise _raop._tcp");
-    if (dnssd_register_airplay(g_dnssd, port) != 0)
+
+    /* TEMPORARY, classic-RAOP bring-up. macOS picks the FairPlay key exchange
+       over RSA no matter what the _raop "et" record offers -- tested with
+       et="0,3,5", "0,5", "0", "0,1" and with ek=1, and it sent a version-0x02
+       FairPlay key message every time. shairport-sync, which macOS does drive
+       over RSA, advertises _raop._tcp ALONE: its _airplay._tcp records are
+       inside #ifdef CONFIG_AIRPLAY_2 (bonjour_strings.c:76). The hypothesis is
+       that a sender which sees an AirPlay 2 service at all stops considering
+       the legacy RSA exchange.
+
+       This tests it without a rebuild per attempt:
+         setprop persist.jetsontv.airplay.legacyonly 1   (then restart the
+         receiver) and the box advertises as a legacy AirPlay 1 device.
+       Mirroring needs _airplay._tcp, so 1 is a diagnostic setting, not a
+       shipping one. Default off. */
+    if (prop_bool("persist.jetsontv.airplay.legacyonly", false)) {
+        ALOGW("legacyonly: NOT advertising _airplay._tcp; mirroring will be"
+              " unavailable until this is turned off");
+    } else if (dnssd_register_airplay(g_dnssd, port) != 0) {
         ALOGW("could not advertise _airplay._tcp");
+    }
 
     ALOGI("AirPlay server on port %u as \"%s\"", port, name);
     result = port;

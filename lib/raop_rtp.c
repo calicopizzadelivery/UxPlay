@@ -53,6 +53,7 @@ struct raop_rtp_s {
     uint32_t rtp_sync;
     uint64_t client_ntp_sync;
     bool initial_sync;
+    unsigned int presync_packets;   /* TEMPORARY: classic-RAOP bring-up */
 
     // Transmission Stats, could be used if a playout buffer is needed
     // float interarrival_jitter; // As defined by RTP RFC 3550, Section 6.4.1
@@ -154,6 +155,7 @@ raop_rtp_init(logger_t *logger, raop_callbacks_t *callbacks, raop_ntp_t *ntp, co
     raop_rtp->rtp_sync = 0;
     raop_rtp->client_ntp_sync = 0;
     raop_rtp->initial_sync = false;
+    raop_rtp->presync_packets = 0;
     
     raop_rtp->ntp_start_time = 0;
     
@@ -492,7 +494,12 @@ raop_rtp_thread_udp(void *arg)
                 uint64_t client_ntp_sync_prev = 0;
                 uint64_t rtp_sync_prev = 0;
                 if (!raop_rtp->initial_sync) {
-                    logger_log(raop_rtp->logger, LOGGER_DEBUG, "first audio rtp sync");
+                    /* TEMPORARY, classic-RAOP bring-up: at INFO because this
+                       is the gate that decides whether any audio is ever
+                       dequeued (see the skip at the data socket below), and a
+                       session that never reaches it is silent with no error.
+                       Once per session, no key material. */
+                    logger_log(raop_rtp->logger, LOGGER_INFO, "first audio rtp sync: audio will now render");
                     raop_rtp->initial_sync = true;
                 } else {
                    client_ntp_sync_prev = raop_rtp->client_ntp_sync;
@@ -601,6 +608,16 @@ raop_rtp_thread_udp(void *arg)
 
             if (!raop_rtp->initial_sync) {
                 /* wait until the first sync before dequeing ALAC */
+                /* TEMPORARY, classic-RAOP bring-up: report the wait once, and
+                   again every 500 packets (~4 s), so "no SYNC ever arrived"
+                   is distinguishable from "nothing is arriving at all". */
+                raop_rtp->presync_packets++;
+                if (raop_rtp->presync_packets == 1 ||
+                    raop_rtp->presync_packets % 500 == 0) {
+                    logger_log(raop_rtp->logger, LOGGER_INFO,
+                               "audio packets arriving but held: %u enqueued with no rtp sync yet",
+                               raop_rtp->presync_packets);
+                }
                 continue;
             } else {
             // Render continuous buffer entries
@@ -667,7 +684,9 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     }
 
     raop_rtp->ct = *ct;
-    raop_rtp->rtp_clock_rate = SECOND_IN_NSECS / *sr;
+    /* double, not integer: 1e9/44100 is 22675.7369614512 and truncating to
+       22675 is a 32.5 ppm rate error. */
+    raop_rtp->rtp_clock_rate = (double) SECOND_IN_NSECS / (double) *sr;
 
     /* Initialize ports and sockets */
     raop_rtp->control_lport = *control_lport;
