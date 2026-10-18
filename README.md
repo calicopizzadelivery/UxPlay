@@ -1,3 +1,81 @@
+# BearPortExpress
+
+**An AirPlay receiver for Android TV, forked from [UxPlay](https://github.com/FDH2/UxPlay).**
+
+Built for [JetsonTV](https://github.com/calicopizzadelivery/jetson-nano-android-tv),
+which turns NVIDIA Jetson Nano boards into Android TV boxes. It runs inside an
+Android system app over JNI, rendering through MediaCodec and AudioTrack, and
+adds AirPlay 1 / classic RAOP support so that macOS can send audio to it.
+
+---
+
+## Thanks, and where this came from
+
+This is somebody else's hard work with our changes on top. Two projects in
+particular deserve the credit:
+
+- **[UxPlay](https://github.com/FDH2/UxPlay)** by fduncanh and contributors —
+  the AirPlay 2 mirroring and audio receiver this is forked from. Everything
+  that works here before our commits is theirs. GPL-3.0-or-later.
+
+- **[shairport-sync](https://github.com/mikebrady/shairport-sync)** by Mike
+  Brady — not forked, but indispensable. Our classic AirPlay 1 / RAOP support
+  was written by reading it. It is what established that the packet format and
+  the crypto were not where our bug was, what showed that a sender chooses its
+  key exchange by whether the receiver advertises `_airplay._tcp`, and where
+  the RSA key exchange and the `Apple-Challenge` response came from. MIT.
+
+And further up the chain, because UxPlay itself stands on them:
+
+- **[shairplay](https://github.com/juhovh/shairplay)** by Juho Vähä-Herttua —
+  the LGPL core that most of `lib/` still descends from, including the RTP
+  receive loop and the reordering buffer. LGPL-2.1-or-later.
+- **David Hammerton** — the ALAC decoder (`android/alac/`). MIT.
+- **Tom Cocagne** — the SRP implementation (`lib/srp.c`). MIT.
+
+## Licence
+
+**GPL-3.0-or-later**, as the most restrictive of the licences in the tree,
+which are mutually compatible:
+
+| licence | where |
+| --- | --- |
+| GPL-3.0-or-later | the work as a whole; `LICENSE`; `lib/crypto.*`; our additions |
+| LGPL-2.1-or-later | most of `lib/`, from shairplay |
+| MIT | `lib/srp.*`, `android/alac/*` |
+
+LGPL-2.1-or-later and MIT are both GPL-3 compatible, so the combined work is
+GPL-3.0-or-later. **This does not permit stripping their notices.** Every file
+keeps the copyright and permission text it arrived with; relicensing the whole
+does not relicense the parts. `external/libplist`, linked rather than merged,
+keeps its own LGPL-2.1 terms.
+
+## One thing that is not a licence question
+
+`lib/airport_key.h` holds Apple's AirPort Express private RSA key, recovered
+from that device's firmware in 2011 and public since. It is the only way an
+independent receiver can accept AirPlay 1 audio at all, and shairport-sync has
+shipped it for over a decade in Debian, Ubuntu and Homebrew. It is **Apple's**,
+covered by none of the licences above, and included here on the project
+owner's explicit decision. See `lib/rsakey.c` for the reasoning and the
+alternatives that were ruled out first.
+
+## What this fork adds
+
+Classic AirPlay 1 / RAOP (`ANNOUNCE`, a `Transport:` SETUP, `Apple-Challenge`
+signing, the RSA key unwrap, uncompressed L16 alongside ALAC), a second
+`_raop._tcp` advertisement so a Mac will use it without losing mirroring, a
+PIN-gated pairing flow, and a set of security fixes found along the way. The
+engineering account lives in
+[docs/airplay.md](https://github.com/calicopizzadelivery/jetson-nano-android-tv/blob/main/docs/airplay.md)
+in the JetsonTV repository.
+
+---
+
+*UxPlay's own README follows, unaltered.*
+
+---
+
 # UxPlay 1.73: AirPlay-Mirror and AirPlay-Audio server for Linux, macOS, and Unix (also runs on Windows).
 
 ### **Now developed at the GitHub site <https://github.com/FDH2/UxPlay> (where ALL user issues should be posted, and latest versions can be found).**
