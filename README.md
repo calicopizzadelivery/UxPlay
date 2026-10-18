@@ -29,9 +29,18 @@ And further up the chain, because UxPlay itself stands on them:
 
 - **[shairplay](https://github.com/juhovh/shairplay)** by Juho Vähä-Herttua —
   the LGPL core that most of `lib/` still descends from, including the RTP
-  receive loop and the reordering buffer. LGPL-2.1-or-later.
+  receive loop and the reordering buffer. LGPL-2.1-or-later. That code also
+  carries work by **dsafa22**, **Jaslo Ziska**, **Joakim Plate** and
+  **Florian Draschbacher**; `lib/NOTICE-shairplay` lists every copyright
+  holder recorded in the headers, and is generated from them rather than
+  maintained by hand.
 - **David Hammerton** — the ALAC decoder (`android/alac/`). MIT.
 - **Tom Cocagne** — the SRP implementation (`lib/srp.c`). MIT.
+
+All of these reach the device: `Android.bp` declares the three licence kinds
+and points `license_text` at each notice, so they render under
+**Settings → About → Legal information** on the built image. That is checked,
+not assumed — see the commit that fixed it.
 
 ## Licence
 

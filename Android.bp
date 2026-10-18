@@ -11,18 +11,36 @@ package {
     default_applicable_licenses: ["external_uxplay_license"],
 }
 
-// UxPlay and playfair are GPLv3 (playfair's LICENSE.md is the same text);
-// llhttp and the ALAC decoder are MIT. All of it ends up in the image's
-// licence notices through this.
+// What is actually in this tree, surveyed file by file rather than assumed:
+//
+//   GPL-3.0-or-later   the work as a whole (LICENSE), lib/crypto.*, playfair
+//                      (its LICENSE.md is the same text), and our additions
+//   LGPL-2.1-or-later  most of lib/ -- the RTP loop, the reordering buffer and
+//                      the rest of the shairplay core by Juho Vähä-Herttua
+//   MIT                lib/srp.* (Tom Cocagne), android/alac/* (David
+//                      Hammerton), lib/llhttp
+//
+// Every one of these has to appear here, not just the most restrictive:
+// license_kinds decides what the compliance tooling believes, and
+// license_text is what is actually rendered into the image's notices and
+// shown under Settings > About > Legal information. Declaring only GPL and
+// MIT left 44 LGPL files and Cocagne's SRP with no notice on the device at
+// all -- "Vähä-Herttua" and "Cocagne" both returned zero hits in the
+// generated NOTICE.xml.gz. Relicensing the whole does not relicense the
+// parts, and it does not excuse dropping their notices either.
 license {
     name: "external_uxplay_license",
     visibility: [":__subpackages__"],
     license_kinds: [
         "SPDX-license-identifier-GPL-3.0-or-later",
+        "SPDX-license-identifier-LGPL-2.1-or-later",
         "SPDX-license-identifier-MIT",
     ],
     license_text: [
         "LICENSE",
+        "lib/COPYING.LESSER",
+        "lib/NOTICE-shairplay",
+        "lib/LICENSE-srp-MIT",
         "lib/llhttp/LICENSE-MIT",
         "android/alac/LICENSE",
     ],
