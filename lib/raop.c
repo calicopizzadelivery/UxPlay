@@ -296,10 +296,33 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         ble = true;
     }
 
- /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/   
+ /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/
     if (!cseq && !raop->hls_support && !ble) {
         logger_log(raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
         return;
+    }
+
+    /* RAIL 24. The gate above is skipped by anything carrying a CSeq header,
+       which is every RTSP request -- so a sender that simply set CSeq walked
+       into the AirPlay-video handler table even with hls_support off. The
+       video handlers are reached by their own URLs, so refuse those outright
+       when HLS is not enabled, independently of CSeq. The six callbacks they
+       use also have stubs now (see raop_init), so this is the outer of two
+       defences rather than the only one. */
+    if (!raop->hls_support && !ble && url) {
+        static const char *video_urls[] = {
+            "/play", "/scrub", "/rate", "/stop", "/playback-info",
+            "/action", "/getProperty", "/setProperty",
+        };
+        for (size_t i = 0; i < sizeof(video_urls) / sizeof(video_urls[0]); i++) {
+            size_t n = strlen(video_urls[i]);
+            if (!strncmp(url, video_urls[i], n) && (url[n] == '\0' || url[n] == '?')) {
+                logger_log(raop->logger, LOGGER_INFO,
+                           "refusing AirPlay video request %s: HLS support is not enabled", url);
+                http_response_init(*response, protocol, 403, "Forbidden");
+                goto finish;
+            }
+        }
     }
 
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
@@ -311,7 +334,31 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP)) {
                 char ipaddr[40] = { '\0' };
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
-                if (httpd_nohold(raop->httpd)) {
+
+                /* RAIL 25. Displacing whoever is watching is a big thing to do
+                   on behalf of an unauthenticated stranger, and it used to
+                   happen on ANY request carrying a CSeq header -- a bare
+                   OPTIONS from anyone on the LAN ended the owner's session.
+
+                   A new sender still takes the television, which is the
+                   intended behaviour for a shared screen, but only on a
+                   request that actually begins a session. Every real sender
+                   opens with one of these; a prober does not. The residual is
+                   that a determined device on the LAN can still displace by
+                   sending a real pairing request, which cannot be closed here:
+                   the eviction happens on first contact, before any
+                   authentication could have taken place. */
+                bool starts_session =
+                    !strcmp(method, "ANNOUNCE") || !strcmp(method, "SETUP") ||
+                    (!strcmp(method, "POST") && url &&
+                     (strstr(url, "/pair-setup") || strstr(url, "/pair-verify") ||
+                      strstr(url, "/pair-pin-start") || strstr(url, "/fp-setup")));
+                if (!starts_session) {
+                    logger_log(raop->logger, LOGGER_INFO,
+                               "%s %s from %s while another client is connected:"
+                               " answering, but not taking the session",
+                               method, url ? url : "", ipaddr);
+                } else if (httpd_nohold(raop->httpd)) {
                     logger_log(raop->logger, LOGGER_INFO, "*****\"nohold\" feature: switch to new connection request from %s", ipaddr);		  
                     httpd_remove_known_connections(raop->httpd);
                     if (raop->callbacks.video_reset) {
@@ -331,9 +378,20 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             logger_log(raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type AirPlay", ptr);            
             httpd_set_connection_type(raop->httpd, ptr, CONNECTION_TYPE_AIRPLAY);
             conn->connection_type = CONNECTION_TYPE_AIRPLAY;
-            conn->client_session_id = (char *) calloc(strlen(client_session_id) + 1, sizeof(char));
-            assert(conn->client_session_id);
-            memcpy(conn->client_session_id, client_session_id, strlen(client_session_id));
+            /* RAIL 15. assert() is a no-op here -- -DNDEBUG is a Soong global --
+               so a failed allocation fell straight through to a NULL memcpy.
+               The header is attacker-supplied and unbounded in length, which
+               is what makes the allocation worth failing gracefully. */
+            size_t session_id_len = strlen(client_session_id);
+            conn->client_session_id = (char *) calloc(session_id_len + 1, sizeof(char));
+            if (!conn->client_session_id) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "could not allocate %zu bytes for X-Apple-Session-ID", session_id_len + 1);
+                *response = http_response_create();
+                http_response_init(*response, protocol, 500, "Internal Server Error");
+                goto finish;
+            }
+            memcpy(conn->client_session_id, client_session_id, session_id_len);
             /* airplay video has been requested: shut down any running RAOP udp services */
             raop_conn_t *raop_conn = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_RAOP, 1);
             if (raop_conn) {
@@ -637,6 +695,38 @@ conn_destroy(void *ptr) {
     free(conn);
 }
 
+
+/* ---------------------------------------------------------------------------
+   Default no-op callbacks for the AirPlay-video / HLS handlers.
+
+   raop_init copies the caller's struct verbatim, so any callback an embedder
+   leaves unset stays NULL and is then called unconditionally from
+   lib/http_handlers.h -- seven call sites, none of them guarded. The Android
+   embedder assigns 27 callbacks and not these six, because it implements no
+   HLS player, which made every one of them a one-request crash reachable from
+   any device on the LAN. RAIL 24.
+
+   Stubs rather than call-site null checks: a check has to be remembered at
+   every future call site, a default cannot be forgotten. The playback-info
+   stub reports "finished", which is the value that makes the HLS handler
+   unwind cleanly rather than wait.
+   --------------------------------------------------------------------------- */
+static void noop_video_play(void *cls, const char *location, const float start_position) {
+    (void) cls; (void) location; (void) start_position;
+}
+static void noop_video_scrub(void *cls, const float position) { (void) cls; (void) position; }
+static void noop_video_rate(void *cls, const float rate) { (void) cls; (void) rate; }
+static void noop_video_stop(void *cls) { (void) cls; }
+static void noop_video_acquire_playback_info(void *cls, playback_info_t *playback_info) {
+    (void) cls;
+    if (playback_info) {
+        memset(playback_info, 0, sizeof(*playback_info));
+        playback_info->duration = -1.0f;   /* "finished": the handler resets */
+    }
+}
+static float noop_video_playlist_remove(void *cls) { (void) cls; return 0.0f; }
+
+
 raop_t *
 raop_init(raop_callbacks_t *callbacks) {
     assert(callbacks);
@@ -663,6 +753,17 @@ raop_init(raop_callbacks_t *callbacks) {
 
     /* Copy callbacks structure */
     memcpy(&raop->callbacks, callbacks, sizeof(raop_callbacks_t));
+
+    /* Anything the embedder left unset gets a stub, so an unauthenticated
+       request cannot reach a NULL function pointer. See the block above. */
+    if (!raop->callbacks.on_video_play) raop->callbacks.on_video_play = noop_video_play;
+    if (!raop->callbacks.on_video_scrub) raop->callbacks.on_video_scrub = noop_video_scrub;
+    if (!raop->callbacks.on_video_rate) raop->callbacks.on_video_rate = noop_video_rate;
+    if (!raop->callbacks.on_video_stop) raop->callbacks.on_video_stop = noop_video_stop;
+    if (!raop->callbacks.on_video_acquire_playback_info)
+        raop->callbacks.on_video_acquire_playback_info = noop_video_acquire_playback_info;
+    if (!raop->callbacks.on_video_playlist_remove)
+        raop->callbacks.on_video_playlist_remove = noop_video_playlist_remove;
 
     /* initialize network port list */ 
     raop->port = 0;    

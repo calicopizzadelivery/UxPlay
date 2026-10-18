@@ -652,14 +652,37 @@ raop_rtp_mirror_thread(void *arg)
                     unsigned char pps_start_code[] = { 0xa2, 0x00, 0x01, 0x00 };
 
                     unsigned char * ptr = payload + 0x75;
- 
+                    const unsigned char *payload_end = payload + payload_size;
+
+                    /* RAIL 15. Every length below comes off the wire from an
+                       unauthenticated mirroring sender, and none of it was
+                       checked: the sizes were read into a SIGNED short, so
+                       anything from 0x8000 up became negative and walked ptr
+                       backwards, and nothing bounded ptr against the end of
+                       the payload. parameter_set_ok() does both. */
+                    #define parameter_set_ok(p, want) \
+                        ((p) >= payload && (p) + (want) <= payload_end && (want) >= 0)
+
+                    if (!parameter_set_ok(ptr, 5)) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "HEVC VPS/SPS/PPS payload too short (%d bytes)", payload_size);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        break;
+                    }
                     if (memcmp(ptr, vps_start_code, 4)) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (VPS)");
                         raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
                         break;
                     }
-                    short vps_size = byteutils_get_short_be(ptr, 3);
+                    int vps_size = (int) (unsigned short) byteutils_get_short_be(ptr, 3);
                     ptr += 5;
+                    if (!parameter_set_ok(ptr, vps_size + 5)) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "HEVC VPS size %d runs past the %d-byte payload",
+                                   vps_size, payload_size);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        break;
+                    }
                     unsigned char *vps = ptr;
                     if (logger_debug) {
                         char *str = utils_data_to_string(vps, vps_size, 16);
@@ -672,8 +695,15 @@ raop_rtp_mirror_thread(void *arg)
                         raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
                         break;
                     }
-                    short sps_size = byteutils_get_short_be(ptr, 3);
+                    int sps_size = (int) (unsigned short) byteutils_get_short_be(ptr, 3);
                     ptr += 5;
+                    if (!parameter_set_ok(ptr, sps_size + 5)) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "HEVC SPS size %d runs past the %d-byte payload",
+                                   sps_size, payload_size);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        break;
+                    }
                     unsigned char *sps = ptr;
                     if (logger_debug) {
                         char *str = utils_data_to_string(sps, sps_size, 16);
@@ -686,8 +716,15 @@ raop_rtp_mirror_thread(void *arg)
                         raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
                         break;
                     }
-                    short pps_size = byteutils_get_short_be(ptr, 3);
+                    int pps_size = (int) (unsigned short) byteutils_get_short_be(ptr, 3);
                     ptr += 5;
+                    if (!parameter_set_ok(ptr, pps_size + 5)) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "HEVC PPS size %d runs past the %d-byte payload",
+                                   pps_size, payload_size);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        break;
+                    }
                     unsigned char *pps = ptr;
                     if (logger_debug) {
                         char *str = utils_data_to_string(pps, pps_size, 16);
@@ -697,7 +734,13 @@ raop_rtp_mirror_thread(void *arg)
 
                     sps_pps_len = vps_size + sps_size + pps_size + 12;
                     sps_pps = (unsigned char*) malloc(sps_pps_len);
-                    assert(sps_pps);
+                    if (!sps_pps) {
+                        /* assert() is a no-op here: -DNDEBUG is a Soong global */
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "could not allocate %d bytes for HEVC parameter sets", sps_pps_len);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        break;
+                    }
                     ptr = sps_pps;
                     memcpy(ptr, nal_start_code, 4);
                     ptr += 4;
