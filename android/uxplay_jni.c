@@ -569,6 +569,7 @@ static void stop_locked(void) {
     if (g_dnssd != NULL) {
         dnssd_unregister_raop(g_dnssd);
         dnssd_unregister_airplay(g_dnssd);
+        dnssd_unregister_legacy(g_dnssd);
     }
     if (g_raop != NULL) {
         raop_destroy(g_raop); /* stops the server and its threads */
@@ -709,25 +710,46 @@ JNIEXPORT jint JNICALL Java_org_lineageos_tv_airplay_UxPlay_nativeStart(
     if (dnssd_register_raop(g_dnssd, port) != 0)
         ALOGW("could not advertise _raop._tcp");
 
-    /* TEMPORARY, classic-RAOP bring-up. macOS picks the FairPlay key exchange
-       over RSA no matter what the _raop "et" record offers -- tested with
-       et="0,3,5", "0,5", "0", "0,1" and with ek=1, and it sent a version-0x02
-       FairPlay key message every time. shairport-sync, which macOS does drive
-       over RSA, advertises _raop._tcp ALONE: its _airplay._tcp records are
-       inside #ifdef CONFIG_AIRPLAY_2 (bonjour_strings.c:76). The hypothesis is
-       that a sender which sees an AirPlay 2 service at all stops considering
-       the legacy RSA exchange.
+    /* macOS picks its key exchange by whether the receiver looks like
+       AirPlay 2, not by the _raop "et" record -- tested with et="0,3,5",
+       "0,5", "0", "0,1" and with ek=1, and it sent a version-0x02 FairPlay
+       key message every time, which lib/playfair cannot unwrap. Without
+       _airplay._tcp it uses the legacy RSA exchange, which works.
 
-       This tests it without a rebuild per attempt:
-         setprop persist.jetsontv.airplay.legacyonly 1   (then restart the
-         receiver) and the box advertises as a legacy AirPlay 1 device.
-       Mirroring needs _airplay._tcp, so 1 is a diagnostic setting, not a
-       shipping one. Default off. */
+       legacyonly=1 drops _airplay._tcp entirely. That makes Mac audio work
+       and mirroring impossible, so it is a diagnostic, not a shipping
+       setting; the second advertisement below is meant to replace it. */
     if (prop_bool("persist.jetsontv.airplay.legacyonly", false)) {
         ALOGW("legacyonly: NOT advertising _airplay._tcp; mirroring will be"
               " unavailable until this is turned off");
     } else if (dnssd_register_airplay(g_dnssd, port) != 0) {
         ALOGW("could not advertise _airplay._tcp");
+    }
+
+    /* A second _raop._tcp, advertised as a legacy AirPlay 1 device under its
+       own hardware address and a suffixed name, so a Mac that resolves it
+       finds no AirPlay 2 counterpart and uses RSA. Same port, so the same
+       server, PIN gate and renderers serve it. See dnssd_register_legacy().
+
+       On by default once it is shown to work; until then the property is the
+       way to try it without a rebuild. The suffix is what the user sees in
+       the AirPlay picker, so it has to say what it is for. */
+    if (prop_bool("persist.jetsontv.airplay.legacyservice", true)) {
+        char suffix[PROP_VALUE_MAX] = { 0 };
+        if (__system_property_get("persist.jetsontv.airplay.legacyname", suffix) <= 0) {
+            snprintf(suffix, sizeof(suffix), " (Audio)");
+        }
+        /* gated only when the pin is on AND audio is not exempt; classic
+           RAOP carries no mirroring stream, so audio is all it can be */
+        int gated = prop_bool("persist.jetsontv.airplay.pin", true) &&
+                    !prop_bool("persist.jetsontv.airplay.openaudio", true);
+        int rc = dnssd_register_legacy(g_dnssd, port, suffix, gated);
+        if (rc != 0) {
+            ALOGW("could not advertise the legacy _raop._tcp service (%d)", rc);
+        } else {
+            ALOGI("also advertising \"%s%s\" as a legacy AirPlay 1 audio device",
+                  name, suffix);
+        }
     }
 
     ALOGI("AirPlay server on port %u as \"%s\"", port, name);

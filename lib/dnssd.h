@@ -37,6 +37,12 @@ DNSSD_API dnssd_t *dnssd_init(const char *name, int name_len, const char *hw_add
 
 DNSSD_API int dnssd_register_raop(dnssd_t *dnssd, unsigned short port);
 DNSSD_API int dnssd_register_airplay(dnssd_t *dnssd, unsigned short port);
+/** A second _raop._tcp advertised as a legacy AirPlay 1 device, so macOS uses
+    the RSA key exchange instead of a FairPlay version we cannot unwrap. The
+    suffix distinguishes it in a sender's list. See the comment in dnssd.c. */
+DNSSD_API int dnssd_register_legacy(dnssd_t *dnssd, unsigned short port, const char *suffix,
+                                    int password_required);
+DNSSD_API void dnssd_unregister_legacy(dnssd_t *dnssd);
 
 DNSSD_API void dnssd_unregister_raop(dnssd_t *dnssd);
 DNSSD_API void dnssd_unregister_airplay(dnssd_t *dnssd);

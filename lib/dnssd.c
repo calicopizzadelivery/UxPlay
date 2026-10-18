@@ -136,9 +136,11 @@ struct dnssd_s {
 
     TXTRecordRef raop_record;
     TXTRecordRef airplay_record;
+    TXTRecordRef legacy_record;
 
     DNSServiceRef raop_service;
     DNSServiceRef airplay_service;
+    DNSServiceRef legacy_service;
 
     char *name;
     int name_len;
@@ -366,6 +368,114 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
                                                           NULL, NULL);
 
     return (int) retval;   /* error codes are listed in Apple's dns_sd.h */
+}
+
+/**
+ * A SECOND _raop._tcp service that looks like a legacy AirPlay 1 device.
+ *
+ * macOS picks its key exchange by whether the receiver looks like AirPlay 2,
+ * not by the "et" record: with _airplay._tcp advertised it demands FairPlay
+ * version 0x02, which lib/playfair cannot unwrap, and it ignores every et/ek
+ * combination (five were tested on the bench, 2026-10-17). Without
+ * _airplay._tcp it uses the legacy RSA exchange, which works -- but dropping
+ * _airplay._tcp costs mirroring, which needs it.
+ *
+ * So advertise both, as two apparently separate devices. This one carries a
+ * different hardware address and a suffixed display name, and only the TXT
+ * keys shairport-sync's classic branch sets (bonjour_strings.c:125-145): no
+ * pk, ft, vs, sf, vv, am or rhd, which are the AirPlay 2 markers. A sender
+ * that resolves this one finds no _airplay._tcp counterpart for it.
+ *
+ * Both point at the same RTSP port, so a session arriving here is served by
+ * the same server, the same PIN gate and the same renderers. That is the
+ * whole reason for doing it in-process rather than running a second daemon:
+ * a shairport-sync sidecar would need its own SELinux domain, would not share
+ * the PIN gate, and would have no route to the now-playing panel without
+ * wiring its metadata pipe.
+ *
+ * UNVERIFIED as of 2026-10-17: this assumes macOS correlates the two service
+ * types by service identity -- the hw address in "<HW>@<name>" and deviceid --
+ * rather than by host or IP. If it correlates by host this cannot work, and
+ * neither could a separate daemon on the same box, for the same reason. Test
+ * with a Mac: it should send a=rsaaeskey to this name.
+ */
+int
+dnssd_register_legacy(dnssd_t *dnssd, unsigned short port, const char *suffix,
+                      int password_required)
+{
+    char servname[MAX_SERVNAME];
+    char legacy_hw[MAX_HWADDR_LEN];
+
+    assert(dnssd);
+    assert(suffix);
+
+    /* A distinct hardware address, derived from ours so it is stable across
+       restarts, with the locally-administered bit set and the last byte
+       altered so it cannot collide with the real one. */
+    int hw_len = dnssd->hw_addr_len;
+    if (hw_len <= 0 || hw_len > (int) sizeof(legacy_hw)) {
+        return -1;
+    }
+    memcpy(legacy_hw, dnssd->hw_addr, (size_t) hw_len);
+    legacy_hw[0] = (char) (legacy_hw[0] | 0x02);      /* locally administered */
+    legacy_hw[hw_len - 1] = (char) (legacy_hw[hw_len - 1] ^ 0x01);
+
+    dnssd->TXTRecordCreate(&dnssd->legacy_record, 0, NULL);
+    /* Exactly shairport-sync's classic set, and nothing else. */
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "txtvers", strlen("1"), "1");
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "ch", strlen(RAOP_CH), RAOP_CH);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "cn", strlen("0,1"), "0,1");
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "da", strlen(RAOP_DA), RAOP_DA);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "et", strlen("0,1"), "0,1");
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "ek", strlen("1"), "1");
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "md", strlen(RAOP_MD), RAOP_MD);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "sr", strlen(RAOP_SR), RAOP_SR);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "ss", strlen(RAOP_SS), RAOP_SS);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "sv", strlen(RAOP_SV), RAOP_SV);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "tp", strlen(RAOP_TP), RAOP_TP);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "vn", strlen(RAOP_VN), RAOP_VN);
+    /* Honest about whether a session here will actually be gated. Classic
+       RAOP is audio by construction, so it is gated only when the pin is on
+       AND "allow audio without a code" is off. Advertising pw=false while
+       refusing without a code is the defect fixed in 4044c1b; do not
+       reintroduce it on this record. */
+    if (password_required) {
+        dnssd->TXTRecordSetValue(&dnssd->legacy_record, "pw", strlen("true"), "true");
+    } else {
+        dnssd->TXTRecordSetValue(&dnssd->legacy_record, "pw", strlen("false"), "false");
+    }
+
+    if (utils_hwaddr_raop(servname, sizeof(servname), legacy_hw, hw_len) < 0) {
+        return -1;
+    }
+    if (sizeof(servname) < strlen(servname) + 1 + (size_t) dnssd->name_len + strlen(suffix) + 1) {
+        return -2;
+    }
+    strncat(servname, "@", sizeof(servname) - strlen(servname) - 1);
+    strncat(servname, dnssd->name, sizeof(servname) - strlen(servname) - 1);
+    strncat(servname, suffix, sizeof(servname) - strlen(servname) - 1);
+
+    DNSServiceErrorType retval =
+        dnssd->DNSServiceRegister(&dnssd->legacy_service, 0, 0,
+                                  servname, "_raop._tcp",
+                                  NULL, NULL,
+                                  htons(port),
+                                  dnssd->TXTRecordGetLength(&dnssd->legacy_record),
+                                  dnssd->TXTRecordGetBytesPtr(&dnssd->legacy_record),
+                                  NULL, NULL);
+    return (int) retval;
+}
+
+void
+dnssd_unregister_legacy(dnssd_t *dnssd)
+{
+    assert(dnssd);
+    if (!dnssd->legacy_service) {
+        return;
+    }
+    dnssd->DNSServiceRefDeallocate(dnssd->legacy_service);
+    dnssd->legacy_service = NULL;
+    dnssd->TXTRecordDeallocate(&dnssd->legacy_record);
 }
 
 int
