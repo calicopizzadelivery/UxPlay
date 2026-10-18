@@ -525,7 +525,16 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     finish:;
     if (!hls_request) {
-        http_response_add_header(*response, "Server", "AirTunes/"GLOBAL_VERSION);
+        /* A legacy sender identifies itself by carrying Apple-Challenge, and
+           expects a classic AirTunes version: shairport-sync answers
+           "AirTunes/105.1" in its classic build (rtsp.c:4219) and macOS talks
+           to it. Our GLOBAL_VERSION is an AirPlay 2 era string, which on the
+           legacy service is as much an AirPlay 2 marker as "pk" in the TXT
+           record. AirPlay 2 senders keep the modern one. */
+        const char *server_version =
+            http_request_get_header(request, "Apple-Challenge")
+                ? "AirTunes/105.1" : "AirTunes/"GLOBAL_VERSION;
+        http_response_add_header(*response, "Server", server_version);
         if (cseq) {
             http_response_add_header(*response, "CSeq", cseq);
         }

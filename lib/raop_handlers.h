@@ -784,7 +784,7 @@ raop_handler_options(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
                      char **response_data, int *response_datalen)
 {
-    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
 }
 
 /* ---------------------------------------------------------------------------
@@ -1131,6 +1131,13 @@ raop_apple_challenge(raop_conn_t *conn, http_request_t *request, http_response_t
     if (n < 32) {
         n = 32;
     }
+
+    /* TEMPORARY: the payload shape, which is what a sender validates against.
+       No key material -- the challenge is the sender's own nonce and the rest
+       is our address and MAC. */
+    logger_log(raop->logger, LOGGER_INFO,
+               "Apple-Challenge: %d-byte challenge, %d-byte local addr, 6-byte mac,"
+               " %d-byte payload", chall_len, conn->locallen, n);
 
     unsigned char sig[512];
     int sig_len = rsa_auth_sign(buf, n, sig, (int) sizeof(sig));

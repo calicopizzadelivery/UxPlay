@@ -432,7 +432,7 @@ dnssd_register_legacy(dnssd_t *dnssd, unsigned short port, const char *suffix,
     dnssd->TXTRecordSetValue(&dnssd->legacy_record, "sr", strlen(RAOP_SR), RAOP_SR);
     dnssd->TXTRecordSetValue(&dnssd->legacy_record, "ss", strlen(RAOP_SS), RAOP_SS);
     dnssd->TXTRecordSetValue(&dnssd->legacy_record, "sv", strlen(RAOP_SV), RAOP_SV);
-    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "tp", strlen(RAOP_TP), RAOP_TP);
+    dnssd->TXTRecordSetValue(&dnssd->legacy_record, "tp", strlen("TCP,UDP"), "TCP,UDP");
     dnssd->TXTRecordSetValue(&dnssd->legacy_record, "vn", strlen(RAOP_VN), RAOP_VN);
     /* Honest about whether a session here will actually be gated. Classic
        RAOP is audio by construction, so it is gated only when the pin is on
