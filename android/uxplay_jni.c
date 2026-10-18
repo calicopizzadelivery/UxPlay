@@ -417,7 +417,26 @@ static void cb_audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *da
     if (env == NULL || g_host == NULL)
         return;
 
-    if (data->ct == 2) {
+    if (data->ct == 1) {
+        /* Uncompressed L16: already PCM, but in network byte order as RFC
+           3551 defines it, where AudioTrack's ENCODING_PCM_16BIT wants host
+           order. shairport does the same swap (player.c:205-207). Classic
+           RAOP only; no AirPlay 2 sender uses this. */
+        int16_t pcm[ALAC_MAX_SPF * 2];
+        int samples = data->data_len / 2;
+        if (samples <= 0 || samples > (int)(sizeof(pcm) / sizeof(pcm[0])))
+            return;
+        const unsigned char *src = (const unsigned char *) data->data;
+        for (int i = 0; i < samples; i++) {
+            /* read big-endian explicitly rather than ntohs on a cast pointer,
+               which would need the source to be 2-byte aligned */
+            pcm[i] = (int16_t) ((src[2 * i] << 8) | src[2 * i + 1]);
+        }
+        jbyteArray arr = to_bytes(env, pcm, samples * 2);
+        (*env)->CallVoidMethod(env, g_host, m_audio_pcm, arr, (jlong)pts);
+        (*env)->DeleteLocalRef(env, arr);
+        check_exception(env, "onAudioPcm");
+    } else if (data->ct == 2) {
         /* ALAC -> interleaved 16-bit stereo, host order, which is what
            AudioTrack's ENCODING_PCM_16BIT wants. */
         int16_t pcm[ALAC_MAX_SPF * 2];

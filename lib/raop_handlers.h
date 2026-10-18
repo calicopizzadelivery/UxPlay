@@ -997,9 +997,13 @@ raop_handler_announce(raop_conn_t *conn,
         }
     }
 
-    /* a=rtpmap:96 AppleLossless -- the only codec this path offers. The
-       uncompressed "L16/44100/2" form shairport also accepts is not wired to
-       our renderers, so refuse it rather than render noise. */
+    /* a=rtpmap decides the codec:
+         "AppleLossless"  -> ct 2, the ALAC decoder
+         "L16/44100/2"    -> ct 1, uncompressed PCM straight through
+       shairport accepts both (player.c:196, ast_uncompressed). L16 costs us
+       nothing but a byte swap and is what scripts/in-container/raopsend
+       sends, which is the only classic sender we have that needs no Apple
+       hardware -- see docs/airplay.md, "Testing the classic path offline". */
     char rtpmap[64] = { 0 };
     val = sdp_attribute(sdp, sdp_len, "rtpmap", &val_len);
     if (val && val_len > 0) {
@@ -1007,9 +1011,14 @@ raop_handler_announce(raop_conn_t *conn,
         int n = val_len < (int) sizeof(rtpmap) - 1 ? val_len : (int) sizeof(rtpmap) - 1;
         memcpy(rtpmap, val, (size_t) n);
     }
-    if (!strstr(rtpmap, "AppleLossless")) {
+    unsigned char codec = 0;
+    if (strstr(rtpmap, "AppleLossless")) {
+        codec = 2;
+    } else if (strstr(rtpmap, "L16")) {
+        codec = 1;
+    } else {
         logger_log(raop->logger, LOGGER_ERR,
-                   "ANNOUNCE a=rtpmap is not AppleLossless: \"%s\"", rtpmap);
+                   "ANNOUNCE a=rtpmap is neither AppleLossless nor L16: \"%s\"", rtpmap);
         http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
         return;
     }
@@ -1021,7 +1030,7 @@ raop_handler_announce(raop_conn_t *conn,
        no other symptom -- hence the refusal below rather than a warning. */
     unsigned short spf = 352;
     unsigned int sr = AUDIO_SAMPLE_RATE;
-    val = sdp_attribute(sdp, sdp_len, "fmtp", &val_len);
+    val = codec == 2 ? sdp_attribute(sdp, sdp_len, "fmtp", &val_len) : NULL;
     if (val && val_len > 0) {
         char fmtp[160] = { 0 };
         int n = val_len < (int) sizeof(fmtp) - 1 ? val_len : (int) sizeof(fmtp) - 1;
@@ -1069,13 +1078,15 @@ raop_handler_announce(raop_conn_t *conn,
     memcpy(conn->classic_aesiv, aesiv, sizeof(conn->classic_aesiv));
     conn->classic_spf = spf;
     conn->classic_sr = sr;
-    conn->classic_ct = 2;
+    conn->classic_ct = codec;
     conn->classic_encrypted = encrypted;
     conn->classic_raop = true;
 
     logger_log(raop->logger, LOGGER_INFO,
-               "classic RAOP session announced: ALAC, %u frames/packet, %u Hz",
-               conn->classic_spf, conn->classic_sr);
+               "classic RAOP session announced: %s, %u frames/packet, %u Hz%s",
+               codec == 2 ? "ALAC" : "uncompressed L16",
+               conn->classic_spf, conn->classic_sr,
+               encrypted ? "" : ", unencrypted");
 }
 
 /** Answer a classic-RAOP "Apple-Challenge" with "Apple-Response".
